@@ -1,0 +1,26 @@
+menu "Watcher BLE Service"
+
+    config WATCHER_BLE_ENABLE
+        bool "Enable BLE control and Wi-Fi provisioning service"
+        default n
+        help
+            Enables BLE GATT server for servo motion control commands and
+            Wi-Fi provisioning/status exchange from the mobile app.
+
+    config WATCHER_BLE_DEVICE_NAME
+        string "BLE device name"
+        depends on WATCHER_BLE_ENABLE
+        default "ESP_ROBOT"
+        help
+            BLE advertising name shown to mobile clients.
+
+    config WATCHER_BLE_CMD_DEFAULT_DURATION_MS
+        int "Default servo move duration (ms)"
+        depends on WATCHER_BLE_ENABLE
+        range 0 5000
+        default 300
+        help
+            Default movement duration for BLE commands without explicit duration.
+            0 means immediate move.
+
+endmenu

@@ -1,0 +1,114 @@
+{
+  "version": "1.0",
+  "default_state": "standby",
+  "states": {
+    "boot": {
+      "loop": false,
+      "motion": [
+        { "at_ms": 0, "x_deg": 90, "y_deg": 120, "duration_ms": 200 }
+      ],
+      "expression": [
+        { "at_ms": 0, "anim": "happy", "text": "Booting...", "font_size": 24 }
+      ],
+      "sound": [
+        { "at_ms": 0, "sound_id": "boot" }
+      ]
+    },
+    "standby": {
+      "loop": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "standby", "text": "", "font_size": 24 }
+      ],
+      "sound": [
+        { "at_ms": 0, "sound_id": "standby" }
+      ]
+    },
+    "listening": {
+      "loop": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "listening", "text": "Listening...", "font_size": 24 }
+      ],
+      "sound": []
+    },
+    "thinking": {
+      "loop": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "thinking", "text": "Thinking...", "font_size": 24 }
+      ],
+      "sound": [
+        { "at_ms": 0, "sound_id": "thinking" }
+      ]
+    },
+    "processing": {
+      "loop": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "processing", "text": "Processing...", "font_size": 24 }
+      ],
+      "sound": []
+    },
+    "speaking": {
+      "loop": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "speaking", "text": "", "font_size": 24 }
+      ],
+      "sound": []
+    },
+    "happy": {
+      "loop": false,
+      "hold_until_replaced": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "happy", "text": "", "font_size": 24 }
+      ],
+      "sound": [
+        { "at_ms": 0, "sound_id": "happy" }
+      ]
+    },
+    "error": {
+      "loop": false,
+      "hold_until_replaced": true,
+      "motion": [],
+      "expression": [
+        { "at_ms": 0, "anim": "error", "text": "", "font_size": 24 }
+      ],
+      "sound": [
+        { "at_ms": 0, "sound_id": "error" }
+      ]
+    },
+    "custom1": {
+      "loop": true,
+      "motion": [
+        { "at_ms": 0, "x_deg": 90, "y_deg": 120, "duration_ms": 300 }
+      ],
+      "expression": [
+        { "at_ms": 0, "anim": "custom1", "text": "", "font_size": 24 }
+      ],
+      "sound": []
+    },
+    "custom2": {
+      "loop": true,
+      "motion": [
+        { "at_ms": 0, "x_deg": 90, "y_deg": 120, "duration_ms": 300 }
+      ],
+      "expression": [
+        { "at_ms": 0, "anim": "custom2", "text": "", "font_size": 24 }
+      ],
+      "sound": []
+    },
+    "custom3": {
+      "loop": true,
+      "motion": [
+        { "at_ms": 0, "x_deg": 90, "y_deg": 120, "duration_ms": 300 }
+      ],
+      "expression": [
+        { "at_ms": 0, "anim": "custom3", "text": "", "font_size": 24 }
+      ],
+      "sound": []
+    }
+  }
+}

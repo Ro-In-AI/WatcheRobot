@@ -1,7 +1,0 @@
-# MVP-W Test Server
-# WebSocket server for audio testing
-
-websockets>=12.0
-PyQt6>=6.5
-numpy>=1.24
-pyaudio>=0.2.14
