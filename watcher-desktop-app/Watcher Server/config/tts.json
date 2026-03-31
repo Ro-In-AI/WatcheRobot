@@ -1,0 +1,40 @@
+{
+    "provider": "huoshan",
+    "common": {
+        "basic": {
+            "sample_rate": 24000
+        },
+        "advanced": {}
+    },
+    "providers": {
+        "huoshan": {
+            "label": "火山引擎 TTS",
+            "basic": {
+                "app_key": "",
+                "access_key": "",
+                "voice_type": "ICL_zh_male_nuanxintitie_tob"
+            },
+            "advanced": {
+                "host": "openspeech.bytedance.com",
+                "api_url": "wss://openspeech.bytedance.com/api/v1/tts/ws_binary",
+                "encoding": "pcm",
+                "speed_ratio": 1,
+                "volume_ratio": 1,
+                "pitch_ratio": 1
+            }
+        },
+        "deepgram": {
+            "label": "Deepgram TTS",
+            "basic": {
+                "api_key": "",
+                "model": "aura-2-thalia-en"
+            },
+            "advanced": {
+                "speak_url": "https://api.deepgram.com/v1/speak",
+                "encoding": "linear16",
+                "container": "none",
+                "timeout": 300
+            }
+        }
+    }
+}

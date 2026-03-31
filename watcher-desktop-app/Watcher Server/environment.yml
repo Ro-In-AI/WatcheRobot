@@ -1,0 +1,28 @@
+name: watcher-server
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip>=23.0
+  - pip:
+    # WebSocket
+    - websockets>=12.0
+
+    # 配置管理
+    - pydantic>=2.0.0
+
+    # 日志
+    - loguru>=0.7.0
+
+    # 阿里云ASR SDK
+    - alibabacloud-nls-python-sdk>=1.0.0
+    - aliyun-python-sdk-core>=2.13.0
+
+    # HTTP客户端
+    - httpx>=0.25.0
+    - aiohttp>=3.9.0
+    - requests>=2.31.0
+
+    # 工具库
+    - typing-extensions>=4.8.0

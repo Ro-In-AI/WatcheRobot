@@ -1,0 +1,29 @@
+{
+    "provider": "openclaw",
+    "common": {
+        "basic": {
+            "history_enabled": true
+        },
+        "advanced": {
+            "max_turns": 6
+        }
+    },
+    "providers": {
+        "openclaw": {
+            "label": "OpenClaw",
+            "basic": {
+                "backend": "tmux",
+                "agent": "main"
+            },
+            "advanced": {
+                "poll_interval": 3,
+                "log_poll_interval": 1
+            }
+        },
+        "llm": {
+            "label": "LLM",
+            "basic": {},
+            "advanced": {}
+        }
+    }
+}

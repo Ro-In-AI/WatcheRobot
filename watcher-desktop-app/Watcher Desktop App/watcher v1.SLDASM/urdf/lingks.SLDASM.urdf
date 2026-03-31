@@ -1,0 +1,153 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<robot
+  name="lingks.SLDASM">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-0.0212 -0.031716 -0.04433"
+        rpy="0 0 0" />
+      <mass
+        value="0.026442" />
+      <inertia
+        ixx="1.2805E-05"
+        ixy="2.4138E-08"
+        ixz="2.3275E-09"
+        iyy="1.1503E-05"
+        iyz="9.7491E-09"
+        izz="2.3676E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://lingks.SLDASM/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.62745 0.62745 0.62745 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://lingks.SLDASM/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="link1">
+    <inertial>
+      <origin
+        xyz="6.4754E-05 -0.001525 -0.019837"
+        rpy="0 0 0" />
+      <mass
+        value="0.010597" />
+      <inertia
+        ixx="2.3063E-06"
+        ixy="4.5099E-08"
+        ixz="-3.6642E-09"
+        iyy="3.0458E-06"
+        iyz="1.7622E-07"
+        izz="1.444E-06" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://lingks.SLDASM/meshes/link1.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.62745 0.62745 0.62745 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://lingks.SLDASM/meshes/link1.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="joint1"
+    type="continuous">
+    <origin
+      xyz="-0.0209999999996985 0 -0.0217499999996899"
+      rpy="1.5707963267949 0.0367776961816941 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="link1" />
+    <axis
+      xyz="0 0 1" />
+  </joint>
+  <link
+    name="link2">
+    <inertial>
+      <origin
+        xyz="-0.0012092 -0.014658 0.012456"
+        rpy="0 0 0" />
+      <mass
+        value="0.050538" />
+      <inertia
+        ixx="2.4921E-05"
+        ixy="-1.2583E-08"
+        ixz="2.7527E-06"
+        iyy="4.1334E-05"
+        iyz="-1.9932E-06"
+        izz="2.8613E-05" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://lingks.SLDASM/meshes/link2.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.62745 0.62745 0.62745 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://lingks.SLDASM/meshes/link2.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="joint2"
+    type="continuous">
+    <origin
+      xyz="0 0 -0.00775458892831293"
+      rpy="-0.0663868244272319 1.64661701168685E-05 -3.34691104104904E-05" />
+    <parent
+      link="link1" />
+    <child
+      link="link2" />
+    <axis
+      xyz="-0.999999999304342 -3.23030508072447E-05 -1.86501747391106E-05" />
+  </joint>
+</robot>

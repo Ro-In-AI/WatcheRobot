@@ -1,0 +1,31 @@
+{
+    "enabled": true,
+    "tasks": [
+        {
+            "name": "idle_non_dialogue_status_push",
+            "type": "idle_ai_status_push",
+            "enabled": true,
+            "interval_seconds": 10,
+            "initial_delay_seconds": 0,
+            "jitter_seconds": 0,
+            "candidate_scopes": [
+                "ambient_flow"
+            ],
+            "candidate_statuses": [],
+            "trigger_probability": 1,
+            "decision_mode": "dialogue_provider",
+            "fallback_mode": "random",
+            "history_limit": 8,
+            "message": ""
+        },
+        {
+            "name": "http_managed_scheduled_tts",
+            "type": "scheduled_tts_push",
+            "enabled": false,
+            "trigger_at": "2026-03-27T18:52:00",
+            "text": "取消提醒",
+            "completed_at": "2026-03-27T18:52:01",
+            "last_result": "sent"
+        }
+    ]
+}

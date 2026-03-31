@@ -1,0 +1,5 @@
+# OpenClaw Prompt Configuration
+
+# System prompt (for TTS scenario)
+# Tell OpenClaw to return plain text, no Markdown format, and no emoji
+TTS_PROMPT=Please reply with concise plain text only. Do not use Markdown format (such as #, **, *, ` etc.), do not use lists, and do not use emojis, emoticons, kaomoji, or decorative symbols. Reply in natural paragraphs. The reply content will be used for text-to-speech synthesis.

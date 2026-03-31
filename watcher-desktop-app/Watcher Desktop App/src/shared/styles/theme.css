@@ -1,0 +1,56 @@
+:root {
+  color-scheme: light;
+  font-family:
+    "SF Pro Display",
+    "SF Pro Text",
+    "Helvetica Neue",
+    "PingFang SC",
+    "Hiragino Sans GB",
+    sans-serif;
+  background:
+    radial-gradient(circle at top left, rgba(255, 215, 176, 0.75), transparent 30%),
+    radial-gradient(circle at top right, rgba(137, 185, 255, 0.34), transparent 32%),
+    linear-gradient(160deg, #f7f4ef 0%, #f4f1eb 42%, #eef3f8 100%);
+  color: #172234;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  font-feature-settings: "kern" 1;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+button {
+  border: 0;
+  background: transparent;
+  color: inherit;
+}
+
+code,
+pre {
+  font-family:
+    "SF Mono",
+    "JetBrains Mono",
+    "Menlo",
+    "Monaco",
+    monospace;
+}

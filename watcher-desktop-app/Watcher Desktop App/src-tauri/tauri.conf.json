@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Watcher Desktop",
+  "mainBinaryName": "watcher-desktop",
+  "version": "0.1.0",
+  "identifier": "com.watcher.desktop",
+  "build": {
+    "beforeBuildCommand": "npm run build:renderer && npm run build:server-bundle",
+    "beforeDevCommand": "npm run dev:renderer",
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:54321"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Watcher Desktop",
+        "width": 1440,
+        "height": 960,
+        "minWidth": 1100,
+        "minHeight": 760,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": [
+      "resources/server"
+    ],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png"
+    ]
+  }
+}

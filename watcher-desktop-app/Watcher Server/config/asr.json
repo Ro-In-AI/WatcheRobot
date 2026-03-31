@@ -1,0 +1,47 @@
+{
+    "provider": "aliyun",
+    "common": {
+        "basic": {
+            "sample_rate": 16000,
+            "channels": 1
+        },
+        "advanced": {}
+    },
+    "providers": {
+        "aliyun": {
+            "label": "阿里云 ASR",
+            "basic": {
+                "appkey": "",
+                "ak_id": "",
+                "ak_secret": "",
+                "token": ""
+            },
+            "advanced": {
+                "url": "wss://nls-gateway-cn-shanghai.aliyuncs.com/ws/v1",
+                "language": "zh-CN",
+                "enable_intermediate_result": true,
+                "enable_punctuation_prediction": true,
+                "enable_inverse_text_normalization": true
+            }
+        },
+        "deepgram": {
+            "label": "Deepgram ASR",
+            "basic": {
+                "api_key": ""
+            },
+            "advanced": {
+                "listen_url": "https://api.deepgram.com/v1/listen",
+                "live_url": "wss://api.deepgram.com/v1/listen",
+                "model": "nova-2",
+                "language": "multi",
+                "detect_language": false,
+                "smart_format": true,
+                "interim_results": true,
+                "punctuate": true,
+                "vad_events": true,
+                "endpointing": 300,
+                "utterance_end_ms": 1000
+            }
+        }
+    }
+}

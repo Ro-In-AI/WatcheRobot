@@ -1,0 +1,757 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Watcher Server 系统设计图谱</title>
+    <style>
+        :root {
+            --bg: #f6efe6;
+            --bg-accent: #e9f2f2;
+            --ink: #1f2937;
+            --muted: #5b6472;
+            --card: rgba(255, 251, 245, 0.88);
+            --card-strong: rgba(255, 255, 255, 0.96);
+            --line: rgba(31, 41, 55, 0.1);
+            --accent: #b85f46;
+            --accent-soft: #f4ddcc;
+            --teal: #2f6f75;
+            --teal-soft: #d9eef1;
+            --shadow: 0 20px 50px rgba(91, 76, 58, 0.12);
+            --radius-xl: 28px;
+            --radius-lg: 22px;
+            --radius-md: 16px;
+            --max-width: 1560px;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            color: var(--ink);
+            font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Segoe UI", sans-serif;
+            background:
+                radial-gradient(circle at top left, rgba(244, 221, 204, 0.95), transparent 34%),
+                radial-gradient(circle at top right, rgba(217, 238, 241, 0.95), transparent 28%),
+                linear-gradient(180deg, #fbf7f2 0%, var(--bg) 100%);
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+                linear-gradient(rgba(31, 41, 55, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(31, 41, 55, 0.03) 1px, transparent 1px);
+            background-size: 28px 28px;
+            mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.45), transparent 92%);
+        }
+
+        .page {
+            position: relative;
+            max-width: var(--max-width);
+            margin: 0 auto;
+            padding: 48px 28px 72px;
+        }
+
+        .hero {
+            position: relative;
+            overflow: hidden;
+            padding: 36px 38px;
+            border-radius: var(--radius-xl);
+            background:
+                linear-gradient(135deg, rgba(255, 255, 255, 0.92), rgba(255, 248, 241, 0.9)),
+                linear-gradient(135deg, var(--accent-soft), var(--teal-soft));
+            border: 1px solid rgba(255, 255, 255, 0.7);
+            box-shadow: var(--shadow);
+        }
+
+        .hero::after {
+            content: "";
+            position: absolute;
+            right: -80px;
+            top: -80px;
+            width: 240px;
+            height: 240px;
+            border-radius: 50%;
+            background: radial-gradient(circle, rgba(47, 111, 117, 0.18), transparent 68%);
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 14px;
+            border-radius: 999px;
+            font-size: 13px;
+            letter-spacing: 0.04em;
+            color: var(--teal);
+            background: rgba(47, 111, 117, 0.1);
+            border: 1px solid rgba(47, 111, 117, 0.16);
+        }
+
+        h1 {
+            margin: 18px 0 12px;
+            font-size: clamp(34px, 5vw, 54px);
+            line-height: 1.08;
+            letter-spacing: -0.03em;
+        }
+
+        .hero p {
+            max-width: 980px;
+            margin: 0;
+            font-size: 17px;
+            line-height: 1.8;
+            color: var(--muted);
+        }
+
+        .summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+            gap: 14px;
+            margin-top: 28px;
+        }
+
+        .summary-card {
+            padding: 18px 18px 16px;
+            border-radius: var(--radius-md);
+            background: rgba(255, 255, 255, 0.72);
+            border: 1px solid rgba(255, 255, 255, 0.72);
+            backdrop-filter: blur(14px);
+        }
+
+        .summary-card strong {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 15px;
+        }
+
+        .summary-card span {
+            display: block;
+            font-size: 13px;
+            line-height: 1.6;
+            color: var(--muted);
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(12, minmax(0, 1fr));
+            gap: 18px;
+            margin-top: 22px;
+        }
+
+        .panel {
+            grid-column: span 12;
+            padding: 24px;
+            border-radius: var(--radius-lg);
+            background: var(--card);
+            border: 1px solid rgba(255, 255, 255, 0.85);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(14px);
+        }
+
+        .panel.half {
+            grid-column: span 6;
+        }
+
+        .panel h2 {
+            margin: 0 0 10px;
+            font-size: 24px;
+            letter-spacing: -0.02em;
+        }
+
+        .panel p {
+            margin: 0 0 14px;
+            font-size: 14px;
+            line-height: 1.8;
+            color: var(--muted);
+        }
+
+        .tags {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-bottom: 16px;
+        }
+
+        .tag {
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 12px;
+            color: var(--ink);
+            background: rgba(255, 255, 255, 0.8);
+            border: 1px solid rgba(31, 41, 55, 0.08);
+        }
+
+        .mermaid-wrap {
+            padding: 18px;
+            border-radius: 20px;
+            background:
+                linear-gradient(180deg, rgba(255, 255, 255, 0.92), rgba(255, 250, 244, 0.96));
+            border: 1px solid rgba(31, 41, 55, 0.08);
+        }
+
+        .mermaid {
+            overflow: auto;
+        }
+
+        .foot {
+            margin-top: 24px;
+            padding: 18px 22px;
+            border-radius: 20px;
+            background: var(--card-strong);
+            border: 1px solid rgba(31, 41, 55, 0.08);
+            box-shadow: var(--shadow);
+        }
+
+        .foot h3 {
+            margin: 0 0 10px;
+            font-size: 18px;
+        }
+
+        .foot ul {
+            margin: 0;
+            padding-left: 18px;
+            color: var(--muted);
+            line-height: 1.8;
+            font-size: 14px;
+        }
+
+        @media (max-width: 1100px) {
+            .panel.half {
+                grid-column: span 12;
+            }
+        }
+
+        @media (max-width: 720px) {
+            .page {
+                padding: 24px 14px 48px;
+            }
+
+            .hero {
+                padding: 24px 20px;
+            }
+
+            h1 {
+                font-size: 30px;
+            }
+
+            .panel {
+                padding: 18px;
+            }
+
+            .mermaid-wrap {
+                padding: 10px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <main class="page">
+        <section class="hero">
+            <div class="eyebrow">Watcher Server · 中文系统图谱</div>
+            <h1>统一协议网关 + 双角色编排 + 语音会话主链路</h1>
+            <p>
+                这套图稿依据项目文档和当前源码整理，重点覆盖用户主时序、模块关系、整体分层、小模块职责拆解与数据流设计。
+                视觉上采用卡片化大画布、暖色与冷色混合分区，方便你直接拿去做评审、讲解或继续细化。
+            </p>
+
+            <div class="summary">
+                <div class="summary-card">
+                    <strong>协议中心</strong>
+                    <span>统一承接文本帧与二进制帧，由 MessageDispatcher 与 protocol_router 完成分发。</span>
+                </div>
+                <div class="summary-card">
+                    <strong>业务主线</strong>
+                    <span>AudioSessionHandler 串起 ASR、AI、TTS，是语音体验的核心编排器。</span>
+                </div>
+                <div class="summary-card">
+                    <strong>配置中心</strong>
+                    <span>RuntimeServices 负责配置读写、热切换、报告回传和运行时状态收敛。</span>
+                </div>
+                <div class="summary-card">
+                    <strong>扩展能力</strong>
+                    <span>ASR、TTS、LLM、OpenClaw 均通过插件化工厂和管理器接入。</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="grid">
+            <article class="panel">
+                <h2>1. 用户主时序图</h2>
+                <p>从发现服务、角色声明到语音上行、AI 回复和 TTS 下行，覆盖真实主路径。</p>
+                <div class="tags">
+                    <span class="tag">用户视角</span>
+                    <span class="tag">语音主链路</span>
+                    <span class="tag">桌面端观测</span>
+                </div>
+                <div class="mermaid-wrap">
+                    <pre class="mermaid">%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#fffaf4",
+    "primaryColor": "#f3dcc6",
+    "primaryTextColor": "#1f2937",
+    "primaryBorderColor": "#c97b63",
+    "lineColor": "#4b5563",
+    "secondaryColor": "#dceef2",
+    "tertiaryColor": "#f8efe4",
+    "actorBkg": "#d7ecef",
+    "actorBorder": "#2f6f75",
+    "actorTextColor": "#12343b",
+    "signalColor": "#1f2937",
+    "signalTextColor": "#1f2937",
+    "labelBoxBkgColor": "#ffffff",
+    "labelBoxBorderColor": "#c97b63",
+    "labelTextColor": "#1f2937",
+    "loopTextColor": "#1f2937",
+    "noteBkgColor": "#fff3c4",
+    "noteBorderColor": "#d9a441",
+    "noteTextColor": "#4b3b1f",
+    "fontFamily": "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+  },
+  "sequence": {
+    "showSequenceNumbers": true,
+    "mirrorActors": false
+  }
+}}%%
+sequenceDiagram
+    autonumber
+    actor EndUser as 用户
+    participant HW as 硬件端客户端
+    participant UDP as UDP服务发现
+    participant WS as WebSocketServer
+    participant DISP as 消息分发与协议路由
+    participant SESSION as 音频会话编排器
+    participant RUNTIME as RuntimeServices
+    participant ASR as ASR Provider
+    participant DIALOGUE as DialogueManager
+    participant TTS as TTS Provider
+    participant DESKTOP as 桌面端客户端
+
+    rect rgb(248, 239, 228)
+        EndUser ->> HW: 发起语音交互
+        HW ->> UDP: DISCOVER
+        UDP -->> HW: ANNOUNCE(ip, ws端口)
+        HW ->> WS: 建立 WebSocket 连接
+        HW ->> WS: sys.client.hello(role=hardware, fw_version)
+        WS -->> HW: sys.ack
+        WS -->> DESKTOP: evt.device.status
+        DESKTOP ->> WS: sys.client.hello(role=desktop)
+        WS -->> DESKTOP: sys.ack
+        WS -->> DESKTOP: evt.device.status
+    end
+
+    rect rgb(220, 238, 242)
+        loop 用户说话期间
+            HW ->> WS: binary.audio(WSPK统一帧)
+            WS ->> DISP: MessageDispatcher.dispatch()
+            DISP ->> SESSION: binary.handle_audio_frame()
+            SESSION ->> RUNTIME: ensure_asr_provider()
+            RUNTIME ->> ASR: stream_start / stream_feed
+            ASR -->> SESSION: 流式识别中间状态
+        end
+    end
+
+    rect rgb(243, 220, 198)
+        HW ->> WS: binary.audio(LAST)
+        WS ->> DISP: 解析末帧
+        DISP ->> SESSION: end_session()
+        SESSION ->> ASR: stream_stop()
+        ASR -->> SESSION: recognized_text
+        SESSION -->> HW: evt.asr.result
+        SESSION ->> RUNTIME: chat(text, media)
+        RUNTIME ->> DIALOGUE: OpenClaw 或 LLM
+        DIALOGUE -->> SESSION: 状态、思考过程、最终回复
+        SESSION -->> HW: evt.ai.status
+        SESSION -->> HW: evt.ai.thinking
+        SESSION -->> HW: evt.ai.reply
+        alt 语音链路异常
+            SESSION -->> DESKTOP: evt.server.error
+        else 正常生成回复
+            SESSION ->> RUNTIME: ensure_tts_provider()
+            RUNTIME ->> TTS: synthesize_stream()
+            loop 分段语音回放
+                TTS -->> SESSION: 音频片段
+                SESSION -->> HW: binary.audio(FIRST...LAST)
+            end
+        end
+    end</pre>
+                </div>
+            </article>
+
+            <article class="panel half">
+                <h2>2. 模块关系图</h2>
+                <p>突出依赖方向、转发方向以及核心编排关系。</p>
+                <div class="mermaid-wrap">
+                    <pre class="mermaid">%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#fffaf4",
+    "primaryColor": "#f7e4ce",
+    "primaryTextColor": "#1f2937",
+    "primaryBorderColor": "#b86f52",
+    "secondaryColor": "#d9eef1",
+    "tertiaryColor": "#eef5f6",
+    "lineColor": "#4b5563",
+    "fontFamily": "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "htmlLabels": true
+  }
+}}%%
+flowchart LR
+    USER["用户"]
+
+    subgraph CLIENTS["客户端角色"]
+        HW["硬件端客户端"]
+        DESKTOP["桌面端客户端"]
+    end
+
+    subgraph ENTRY["接入层"]
+        MAIN["WatcherServer<br/>src/main.py"]
+        WS["WebSocketServer<br/>连接管理 / 广播 / 会话容器"]
+        REG["DeviceRegistry<br/>设备在线状态与固件快照"]
+        DISC["UDP 服务发现"]
+    end
+
+    subgraph PROTOCOL["协议层"]
+        DISP["MessageDispatcher<br/>文本与二进制解析分发"]
+        ROUTER["protocol_router<br/>消息类型注册表"]
+        SYS["system handler"]
+        CTRL["control handler"]
+        CFG["config handler"]
+        EVT["event handler"]
+        XFER["transfer handler"]
+        BIN["binary handler"]
+    end
+
+    subgraph BIZ["业务编排层"]
+        SESSION["AudioSessionHandler<br/>ASR -> AI -> TTS 编排"]
+        MEDIA["SessionMediaStore<br/>图片/视频重组与缓存"]
+        SENDER["MessageHandler<br/>统一文本/二进制发送"]
+    end
+
+    subgraph RUNTIME["运行时与配置中心"]
+        RS["RuntimeServices"]
+        DLG["DialogueManager"]
+        STORE["JsonConfigStore"]
+        JSONCFG["config/*.json"]
+    end
+
+    subgraph PLUGINS["插件能力层"]
+        ASR["ASR Manager / Provider"]
+        TTS["TTS Manager / Provider"]
+        LLM["LLM Manager / Provider"]
+        OC["OpenClaw Provider"]
+    end
+
+    USER --> HW
+    HW --> DISC
+    DISC --> HW
+    MAIN --> RS
+    MAIN --> WS
+    HW --> WS
+    DESKTOP --> WS
+    WS --> REG
+    WS --> SESSION
+    WS --> DISP
+    DISP --> ROUTER
+    ROUTER --> SYS
+    ROUTER --> CTRL
+    ROUTER --> CFG
+    ROUTER --> EVT
+    ROUTER --> XFER
+    ROUTER --> BIN
+    BIN --> SESSION
+    SYS --> REG
+    SYS --> RS
+    CTRL --> WS
+    EVT --> WS
+    XFER --> WS
+    CFG --> RS
+    SESSION --> MEDIA
+    SESSION --> SENDER
+    SESSION --> RS
+    RS --> STORE
+    STORE --> JSONCFG
+    RS --> DLG
+    RS --> ASR
+    RS --> TTS
+    DLG --> LLM
+    DLG --> OC</pre>
+                </div>
+            </article>
+
+            <article class="panel half">
+                <h2>3. 整体分层架构图</h2>
+                <p>适合做总览汇报，按层展示从终端到底层能力的完整架构。</p>
+                <div class="mermaid-wrap">
+                    <pre class="mermaid">%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#fffaf4",
+    "primaryColor": "#f4dac8",
+    "primaryTextColor": "#1f2937",
+    "primaryBorderColor": "#be6d55",
+    "secondaryColor": "#d7ecef",
+    "tertiaryColor": "#f2f6f7",
+    "lineColor": "#4b5563",
+    "fontFamily": "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+  },
+  "flowchart": {
+    "curve": "linear",
+    "htmlLabels": true
+  }
+}}%%
+flowchart TB
+    subgraph L0["第 0 层：用户与终端"]
+        USER0["用户"]
+        HARD0["硬件端客户端<br/>音频 / 视频 / 图片 / 舵机 / OTA"]
+        DESK0["桌面端客户端<br/>配置界面 / 监控界面 / 控制面板"]
+    end
+
+    subgraph L1["第 1 层：接入网关层"]
+        UDP0["DiscoveryServer<br/>局域网 UDP 发现"]
+        WS0["WebSocketServer<br/>连接管理 / 角色识别 / 广播 / 生命周期"]
+    end
+
+    subgraph L2["第 2 层：协议编排层"]
+        MODEL0["TextMessage / BinaryFrame<br/>统一协议模型"]
+        DISP0["MessageDispatcher"]
+        CTX0["ProtocolHandlerContext"]
+        ROUTE0["protocol_router + protocol_handlers"]
+    end
+
+    subgraph L3["第 3 层：业务编排层"]
+        AUDIO0["AudioSessionHandler<br/>语音会话主编排"]
+        MEDIA0["SessionMediaStore<br/>最近媒体缓存"]
+        DEVICE0["DeviceRegistry<br/>设备状态注册"]
+        SEND0["MessageHandler<br/>统一消息发送"]
+    end
+
+    subgraph L4["第 4 层：运行时与配置中心"]
+        RS0["RuntimeServices"]
+        DLG0["DialogueManager<br/>openclaw / llm 模式切换"]
+        STORE0["JsonConfigStore"]
+        CFG0["config/asr.json<br/>config/tts.json<br/>config/llm.json<br/>config/dialogue.json"]
+    end
+
+    subgraph L5["第 5 层：能力插件层"]
+        ASR0["ASR 插件体系"]
+        TTS0["TTS 插件体系"]
+        LLM0["LLM 插件体系"]
+        OC0["OpenClaw 插件体系"]
+    end
+
+    subgraph L6["第 6 层：外部能力与执行环境"]
+        VENDOR0["阿里云 / Deepgram / 火山引擎 / Ark"]
+        AGENT0["Local / Tmux OpenClaw Agent"]
+    end
+
+    USER0 --> HARD0
+    USER0 --> DESK0
+    HARD0 --> UDP0
+    HARD0 --> WS0
+    DESK0 --> WS0
+    UDP0 --> WS0
+    WS0 --> MODEL0
+    WS0 --> DISP0
+    DISP0 --> CTX0
+    DISP0 --> ROUTE0
+    ROUTE0 --> AUDIO0
+    ROUTE0 --> DEVICE0
+    ROUTE0 --> SEND0
+    AUDIO0 --> MEDIA0
+    AUDIO0 --> RS0
+    DEVICE0 --> WS0
+    SEND0 --> WS0
+    RS0 --> STORE0
+    STORE0 --> CFG0
+    RS0 --> DLG0
+    RS0 --> ASR0
+    RS0 --> TTS0
+    DLG0 --> LLM0
+    DLG0 --> OC0
+    ASR0 --> VENDOR0
+    TTS0 --> VENDOR0
+    LLM0 --> VENDOR0
+    OC0 --> AGENT0</pre>
+                </div>
+            </article>
+
+            <article class="panel">
+                <h2>4. 小模块拆解图</h2>
+                <p>更接近代码结构，适合开发同学快速理解每个模块的职责边界与上下游。</p>
+                <div class="mermaid-wrap">
+                    <pre class="mermaid">%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#fffaf4",
+    "primaryColor": "#f8e7d5",
+    "primaryTextColor": "#1f2937",
+    "primaryBorderColor": "#bf7256",
+    "secondaryColor": "#dcedf0",
+    "tertiaryColor": "#f5f1eb",
+    "lineColor": "#4b5563",
+    "fontFamily": "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+  },
+  "flowchart": {
+    "curve": "stepBefore",
+    "htmlLabels": true
+  }
+}}%%
+flowchart TB
+    subgraph SERVER["Watcher Server 内部小模块设计"]
+        subgraph CONN["A. 连接与会话容器"]
+            WS1["WebSocketServer<br/>- connected_clients<br/>- client_roles<br/>- client_last_seen<br/>- client_metadata<br/>- client_sessions"]
+            REG1["DeviceRegistry<br/>- 在线硬件清单<br/>- fw/hw/board/mac 快照"]
+        end
+
+        subgraph PRT["B. 协议处理子系统"]
+            DISP1["MessageDispatcher<br/>解析 str / bytes"]
+            ROUTER1["Protocol Router<br/>建立 消息类型 -> handler 映射"]
+            SYS1["system.py<br/>角色声明 / 心跳 / ACK / NACK"]
+            CTRL1["control.py<br/>桌面到硬件控制转发"]
+            CFG1["config.py<br/>配置读取 / 校验 / 热更新"]
+            EVT1["event.py<br/>硬件事件转发 / 状态同步"]
+            XFER1["transfer.py<br/>OTA 握手与传输会话"]
+            BIN1["binary.py<br/>音频 / 视频 / 图片 / OTA"]
+        end
+
+        subgraph SES["C. 音频会话子系统"]
+            AUDIO1["AudioSessionHandler<br/>- ASR 流状态<br/>- 超时定时器<br/>- 会话级 AI key<br/>- 端到端语音编排"]
+            MEDIA1["SessionMediaStore<br/>- 图片/视频分片重组<br/>- 最近媒体缓存<br/>- AI 多模态上下文注入"]
+            SEND1["MessageHandler<br/>- 文本帧发送<br/>- 二进制音频发送<br/>- ACK / NACK 封装"]
+        end
+
+        subgraph RUN1["D. 运行时子系统"]
+            RS1["RuntimeServices<br/>- initialize<br/>- ensure_*_provider<br/>- get_*_report<br/>- update_*_config"]
+            DLG1["DialogueManager<br/>- openclaw / llm 切换<br/>- runtime 状态暴露<br/>- 回调桥接"]
+            STORE1["JsonConfigStore<br/>原子读写 JSON 配置"]
+        end
+
+        subgraph PLG1["E. 插件与提供商"]
+            ASR1["ASRFactory / ASRManager"]
+            TTS1["TTSFactory / TTSManager"]
+            LLM1["LLMFactory / LLMManager"]
+            OC1["OpenClawFactory / ProviderRegistry"]
+        end
+    end
+
+    WS1 --> REG1
+    WS1 --> DISP1
+    DISP1 --> ROUTER1
+    ROUTER1 --> SYS1
+    ROUTER1 --> CTRL1
+    ROUTER1 --> CFG1
+    ROUTER1 --> EVT1
+    ROUTER1 --> XFER1
+    ROUTER1 --> BIN1
+    BIN1 --> AUDIO1
+    SYS1 --> RS1
+    SYS1 --> REG1
+    CTRL1 --> WS1
+    EVT1 --> WS1
+    EVT1 --> REG1
+    XFER1 --> WS1
+    CFG1 --> RS1
+    AUDIO1 --> MEDIA1
+    AUDIO1 --> SEND1
+    AUDIO1 --> RS1
+    RS1 --> DLG1
+    RS1 --> STORE1
+    RS1 --> ASR1
+    RS1 --> TTS1
+    DLG1 --> LLM1
+    DLG1 --> OC1</pre>
+                </div>
+            </article>
+
+            <article class="panel">
+                <h2>5. 数据流设计图</h2>
+                <p>把语音、配置、状态控制、媒体上下文四种流拆开，更方便做问题定位和容量分析。</p>
+                <div class="mermaid-wrap">
+                    <pre class="mermaid">%%{init: {
+  "theme": "base",
+  "themeVariables": {
+    "background": "#fffaf4",
+    "primaryColor": "#f5e0cf",
+    "primaryTextColor": "#1f2937",
+    "primaryBorderColor": "#bd6e55",
+    "secondaryColor": "#dbedf0",
+    "tertiaryColor": "#f7f3ed",
+    "lineColor": "#4b5563",
+    "fontFamily": "PingFang SC, Hiragino Sans GB, Microsoft YaHei, sans-serif"
+  },
+  "flowchart": {
+    "curve": "basis",
+    "htmlLabels": true
+  }
+}}%%
+flowchart TB
+    subgraph FLOW_A["数据流 A：语音主链路"]
+        A1["硬件端 binary.audio"] --> A2["binary handler"]
+        A2 --> A3["AudioSessionHandler.feed_audio / end_session"]
+        A3 --> A4["ASR.stream_feed / stream_stop"]
+        A4 --> A5["evt.asr.result"]
+        A5 --> A6["RuntimeServices.chat"]
+        A6 --> A7["DialogueManager / OpenClaw / LLM"]
+        A7 --> A8["evt.ai.status / evt.ai.thinking / evt.ai.reply"]
+        A8 --> A9["TTS.synthesize_stream"]
+        A9 --> A10["下行 binary.audio"]
+    end
+
+    subgraph FLOW_B["数据流 B：配置中心链路"]
+        B1["桌面端 cfg.*.get / cfg.*.update"] --> B2["config handler"]
+        B2 --> B3["RuntimeServices"]
+        B3 --> B4["JsonConfigStore"]
+        B4 --> B5["config/*.json"]
+        B3 --> B6["ASR / TTS / LLM / Dialogue 热切换"]
+        B6 --> B7["cfg.*.report 广播到桌面端"]
+    end
+
+    subgraph FLOW_C["数据流 C：状态与控制链路"]
+        C1["桌面端 ctrl.servo.angle"] --> C2["control handler"]
+        C2 --> C3["广播到硬件端"]
+        C4["硬件端 evt.* / xfer.ota.handshake"] --> C5["event / transfer handler"]
+        C5 --> C6["广播到桌面端"]
+        C7["硬件端 evt.device.firmware"] --> C8["DeviceRegistry 更新"]
+        C8 --> C9["evt.device.status 广播"]
+    end
+
+    subgraph FLOW_D["数据流 D：媒体上下文链路"]
+        D1["硬件端 binary.video / binary.image"] --> D2["binary handler"]
+        D2 --> D3["SessionMediaStore 重组与缓存"]
+        D3 --> D4["AudioSessionHandler 调用 RuntimeServices.chat(media=...)"]
+        D4 --> D5["OpenClaw Provider 多模态输入"]
+    end</pre>
+                </div>
+            </article>
+        </section>
+
+        <section class="foot">
+            <h3>当前设计结论</h3>
+            <ul>
+                <li>系统的真正核心不是某一个 Provider，而是统一协议层与 AudioSessionHandler 的编排能力。</li>
+                <li>桌面端是配置与观测面，硬件端是实时音视频与控制执行面，服务端承担协议枢纽与编排中台角色。</li>
+                <li>当前已接通主链路包括角色声明、配置中心、舵机控制、设备状态同步、语音会话、视频/图片转发和媒体上下文注入。</li>
+                <li>当前保留但未闭环的能力主要是 sys.session.resume、ctrl.camera.* 与完整 OTA 传输链路。</li>
+            </ul>
+        </section>
+    </main>
+
+    <script type="module">
+        import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+
+        mermaid.initialize({
+            startOnLoad: true,
+            securityLevel: "loose"
+        });
+    </script>
+</body>
+</html>

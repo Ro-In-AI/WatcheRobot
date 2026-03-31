@@ -1,0 +1,66 @@
+{
+    "thinking": {
+        "label": "正在思考",
+        "description": "AI 已开始处理当前用户输入",
+        "scope": "dialogue_flow",
+        "image_name": "thinking",
+        "action_file": "thinking",
+        "sound_file": "thinking"
+    },
+    "processing": {
+        "label": "处理中",
+        "description": "AI 正在处理中间步骤或资源准备阶段",
+        "scope": "dialogue_flow",
+        "image_name": "thinking",
+        "action_file": "thinking",
+        "sound_file": "thinking"
+    },
+    "listening": {
+        "label": "正在聆听",
+        "description": "当前处于语音输入监听阶段",
+        "scope": "dialogue_flow",
+        "image_name": "thinking",
+        "action_file": "thinking",
+        "sound_file": ""
+    },
+    "speaking": {
+        "label": "正在播报",
+        "description": "当前处于语音播报输出阶段",
+        "scope": "dialogue_flow",
+        "image_name": "",
+        "action_file": "",
+        "sound_file": ""
+    },
+    "standby": {
+        "label": "待机中",
+        "description": "系统空闲时的待机状态，属于非语言对话流",
+        "scope": "ambient_flow",
+        "image_name": "",
+        "action_file": "",
+        "sound_file": ""
+    },
+    "custom3": {
+        "label": "观察中",
+        "description": "系统空闲时的环境观察状态，属于非语言对话流",
+        "scope": "ambient_flow",
+        "image_name": "",
+        "action_file": "",
+        "sound_file": ""
+    },
+    "completed": {
+        "label": "已完成",
+        "description": "AI 已完成本轮生成，通常后续会继续发送 evt.ai.reply",
+        "scope": "dialogue_flow",
+        "image_name": "",
+        "action_file": "",
+        "sound_file": ""
+    },
+    "error": {
+        "label": "处理失败",
+        "description": "AI 在内部处理阶段返回错误",
+        "scope": "dialogue_flow",
+        "image_name": "",
+        "action_file": "",
+        "sound_file": ""
+    }
+}

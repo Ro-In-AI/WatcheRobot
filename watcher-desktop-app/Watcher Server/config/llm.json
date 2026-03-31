@@ -1,0 +1,25 @@
+{
+    "provider": "ark",
+    "common": {
+        "basic": {
+            "temperature": 0.7,
+            "max_tokens": 2048
+        },
+        "advanced": {
+            "top_p": 0.9,
+            "stream": false
+        }
+    },
+    "providers": {
+        "ark": {
+            "label": "火山 Ark LLM",
+            "basic": {
+                "api_key": "",
+                "model": "deepseek-v3-2-251201"
+            },
+            "advanced": {
+                "base_url": "https://ark.cn-beijing.volces.com/api/v3"
+            }
+        }
+    }
+}
