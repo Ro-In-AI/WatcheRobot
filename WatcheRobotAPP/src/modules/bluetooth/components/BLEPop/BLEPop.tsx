@@ -91,7 +91,7 @@ export const BLEPop: React.FC<BLEPopProps> = ({
                 }),
             ]).start();
         }
-    }, [isVisible]);
+    }, [fadeAnim, isVisible, slideAnim]);
 
     // 连接动画效果
     useEffect(() => {

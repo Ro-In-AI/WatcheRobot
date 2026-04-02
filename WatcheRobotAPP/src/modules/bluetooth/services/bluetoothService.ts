@@ -1,5 +1,5 @@
 import { PermissionsAndroid, Platform } from 'react-native';
-import { BleManager, Device, Subscription } from 'react-native-ble-plx';
+import { BleErrorCode, BleManager, Device, Subscription } from 'react-native-ble-plx';
 import base64 from 'react-native-base64';
 import {
     ConnectOptions,
@@ -13,6 +13,79 @@ import { BLUETOOTH_DEFAULT_CONFIG, BLUETOOTH_UUIDS } from '../constants/bluetoot
 
 // 通知订阅的唯一标识符类型，格式为 "serviceUUID:characteristicUUID"
 type NotificationKey = `${string}:${string}`;
+
+const SERVICE_LOG_PREFIX = '[蓝牙][服务]';
+
+const logService = (message: string, details?: unknown) => {
+    if (details !== undefined) {
+        console.log(SERVICE_LOG_PREFIX, message, details);
+        return;
+    }
+
+    console.log(SERVICE_LOG_PREFIX, message);
+};
+
+const warnService = (message: string, details?: unknown) => {
+    if (details !== undefined) {
+        console.warn(SERVICE_LOG_PREFIX, message, details);
+        return;
+    }
+
+    console.warn(SERVICE_LOG_PREFIX, message);
+};
+
+const errorService = (message: string, details?: unknown) => {
+    if (details !== undefined) {
+        console.error(SERVICE_LOG_PREFIX, message, details);
+        return;
+    }
+
+    console.error(SERVICE_LOG_PREFIX, message);
+};
+
+const formatDeviceSummary = (device: Partial<Device> | null | undefined) => ({
+    id: device?.id ?? null,
+    name: device?.name ?? null,
+    localName: device?.localName ?? null,
+    rssi: device?.rssi ?? null,
+    mtu: device?.mtu ?? null,
+});
+
+const sanitizeTextPreview = (value: string, maxLength: number = 120) => {
+    let sanitized = value;
+
+    if (value.startsWith('WIFI_CONFIG:')) {
+        const payload = value.slice('WIFI_CONFIG:'.length);
+        try {
+            const parsed = JSON.parse(payload);
+            sanitized = `WIFI_CONFIG:${JSON.stringify({
+                ...parsed,
+                password: parsed?.password ? '***' : '',
+            })}`;
+        } catch {
+            sanitized = 'WIFI_CONFIG:<invalid-json>';
+        }
+    }
+
+    const compact = sanitized.replace(/\s+/g, ' ').trim();
+    return compact.length > maxLength ? `${compact.slice(0, maxLength)}...` : compact;
+};
+
+const formatPayloadSummary = (value: Uint8Array | string) => {
+    if (typeof value === 'string') {
+        return {
+            type: 'text',
+            length: value.length,
+            preview: sanitizeTextPreview(value),
+        };
+    }
+
+    return {
+        type: 'bytes',
+        length: value.length,
+        preview: Array.from(value.slice(0, 16)),
+    };
+};
 
 /**
  * 蓝牙服务类
@@ -33,7 +106,7 @@ type NotificationKey = `${string}:${string}`;
  *
  * @category Services
  */
-class BluetoothService {
+export class BluetoothService {
     // BLE 管理器实例
     private manager: BleManager;
 
@@ -55,6 +128,9 @@ class BluetoothService {
     // 扫描状态标识
     private scanning = false;
 
+    // 当前扫描流程的完成回调，用于在手动 stopScan 时唤醒等待中的调用方
+    private scanCompletionResolver: (() => void) | null = null;
+
     // 断开连接状态标识
     private isDisconnecting = false;
 
@@ -64,8 +140,9 @@ class BluetoothService {
      * 构造函数
      * 初始化 BLE 管理器实例
      */
-    constructor() {
-        this.manager = new BleManager();
+    constructor(manager?: BleManager) {
+        this.manager = manager ?? new BleManager();
+        logService('蓝牙管理器已创建');
     }
 
     /**
@@ -78,8 +155,10 @@ class BluetoothService {
      * @throws {Error} 当权限被拒绝或蓝牙未启用时抛出错误
      */
     async initialize(): Promise<void> {
+        logService('开始初始化蓝牙服务', { platform: Platform.OS });
         await this.ensurePermissions();
         await this.ensureBluetoothEnabled();
+        logService('蓝牙服务初始化完成');
     }
 
     /**
@@ -90,9 +169,11 @@ class BluetoothService {
      */
     async getAdapterState(): Promise<string> {
         try {
-            return await this.manager.state();
+            const state = await this.manager.state();
+            logService('读取蓝牙适配器状态', { state });
+            return state;
         } catch (error) {
-            console.warn('获取蓝牙状态失败:', error);
+            warnService('读取蓝牙适配器状态失败', error);
             return 'Unknown';
         }
     }
@@ -121,7 +202,7 @@ class BluetoothService {
         try {
             return await this.manager.isDeviceConnected(targetId);
         } catch (error) {
-            console.warn('BLE isDeviceConnected error:', error);
+            warnService('检查设备连接状态失败', { targetId, error });
             return false;
         }
     }
@@ -145,23 +226,55 @@ class BluetoothService {
                 this.stopScan();
             }
 
+            let settled = false;
+            const resolveScan = () => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                this.scanCompletionResolver = null;
+                resolve();
+            };
+
+            const rejectScan = (error: Error) => {
+                if (settled) {
+                    return;
+                }
+
+                settled = true;
+                this.scanCompletionResolver = null;
+                reject(error);
+            };
+
             const { timeout, filter } = options;
             this.scanning = true;
+            this.scanCompletionResolver = resolveScan;
             let scanError: Error | null = null;
+            const seenDeviceIds = new Set<string>();
+
+            logService('开始扫描设备', {
+                timeout: timeout ?? null,
+                hasFilter: Boolean(filter),
+            });
 
             // 开始设备扫描
             this.manager.startDeviceScan(null, null, (error, device) => {
                 if (error) {
-                    console.error('BLE scan error:', error);
+                    errorService('扫描设备失败', error);
                     scanError = error;
                     this.stopScan();
-                    reject(error);
+                    rejectScan(error);
                     return;
                 }
 
                 if (device) {
                     // 应用过滤器（如果提供）
                     if (!filter || filter(device)) {
+                        if (!seenDeviceIds.has(device.id)) {
+                            seenDeviceIds.add(device.id);
+                            logService('发现设备', formatDeviceSummary(device));
+                        }
                         onDeviceFound(device);
                     }
                 }
@@ -170,10 +283,11 @@ class BluetoothService {
             // 设置扫描超时
             if (timeout) {
                 this.scanTimer = setTimeout(() => {
+                    logService('扫描超时，准备停止扫描', { timeout });
                     // console.log('🕐 扫描超时，停止扫描');
                     this.stopScan();
                     if (!scanError) {
-                        resolve(); // 超时正常结束
+                        resolveScan(); // 超时正常结束
                     }
                 }, timeout);
             }
@@ -189,6 +303,9 @@ class BluetoothService {
      * - 重置扫描状态
      */
     stopScan(): void {
+        const resolvePendingScan = this.scanCompletionResolver;
+        this.scanCompletionResolver = null;
+
         if (this.scanTimer) {
             clearTimeout(this.scanTimer);
             this.scanTimer = null;
@@ -197,11 +314,14 @@ class BluetoothService {
         if (this.scanning) {
             try {
                 this.manager.stopDeviceScan();
+                logService('扫描已停止');
             } catch (error) {
-                console.warn('BLE stop scan error:', error);
+                warnService('停止扫描失败', error);
             }
             this.scanning = false;
         }
+
+        resolvePendingScan?.();
     }
 
     // #endregion
@@ -226,18 +346,29 @@ class BluetoothService {
                 autoConnect = false,
                 requestMTU = Platform.OS === 'android' ? BLUETOOTH_DEFAULT_CONFIG.MTU_ANDROID : undefined,
             } = options;
+            logService('开始连接设备', {
+                deviceId,
+                timeout,
+                autoConnect,
+                requestMTU: requestMTU ?? null,
+            });
 
             // 🟡 先从缓存查
             const known = await this.manager.devices([deviceId]);
+            logService('缓存设备查询完成', {
+                deviceId,
+                knownCount: known.length,
+            });
 
             // 🔵 如果系统还不认识这个设备，快速扫描一次确认
             if (!known || known.length === 0) {
+                logService('缓存中没有目标设备，开始快速扫描确认', { deviceId });
                 // console.log('设备未在缓存中，开始快速扫描确认...');
                 const found = await new Promise<boolean>((resolve) => {
                     let resolved = false;
                     this.manager.startDeviceScan(null, null, (error, device) => {
                         if (error) {
-                            console.warn('快速扫描出错:', error);
+                            warnService('快速扫描失败', error);
                             if (!resolved) resolve(false);
                             resolved = true;
                             this.manager.stopDeviceScan();
@@ -245,6 +376,7 @@ class BluetoothService {
                         }
 
                         if (device && device.id === deviceId) {
+                            logService('快速扫描命中目标设备', formatDeviceSummary(device));
                             // console.log('快速扫描到目标设备:', deviceId);
                             if (!resolved) resolve(true);
                             resolved = true;
@@ -261,6 +393,7 @@ class BluetoothService {
                 });
 
                 if (!found) {
+                    warnService('快速扫描未发现目标设备', { deviceId });
                     throw new Error('未发现目标设备，请确认设备已开机并靠近手机');
                 }
             }
@@ -271,16 +404,21 @@ class BluetoothService {
                 autoConnect,
                 requestMTU,
             });
+            logService('设备连接成功', formatDeviceSummary(device));
 
             // 发现所有服务和特征值
             await device.discoverAllServicesAndCharacteristics();
+            logService('服务与特征发现完成', {
+                deviceId: device.id,
+                mtu: device.mtu ?? null,
+            });
 
             // 处理连接成功的设备
             this.handleConnectedDevice(device);
             this.connectedDevice = device;
             return device;
         } catch (error) {
-            console.error('BLE connect error:', error);
+            errorService('连接设备失败', error);
 
             // 连接失败时不做额外处理，让上层逻辑处理缓存清理和重连
 
@@ -296,13 +434,20 @@ class BluetoothService {
     async disconnectDevice(deviceId?: string): Promise<void> {
         const current = this.connectedDevice;
         if (!current) {
+            logService('没有已连接设备，跳过断开流程');
             return;
         }
 
         // 如果指定了设备 ID 且与当前设备不匹配，则不执行断开操作
         if (deviceId && current.id !== deviceId) {
+            warnService('断开连接时设备 ID 不匹配，已跳过', {
+                expectedDeviceId: deviceId,
+                connectedDeviceId: current.id,
+            });
             return;
         }
+
+        logService('开始断开设备连接', formatDeviceSummary(current));
 
         // 清理所有通知订阅
         this.stopNotifications();
@@ -315,11 +460,12 @@ class BluetoothService {
             // 取消设备连接
             await current.cancelConnection();
         } catch (error) {
-            console.warn('BLE disconnect error:', error);
+            warnService('断开设备连接失败', error);
         } finally {
             // 重置连接状态
             this.connectedDevice = null;
             this.connectedDevice = null;
+            logService('设备连接已断开', { deviceId: current.id });
         }
     }
 
@@ -351,6 +497,12 @@ class BluetoothService {
     startNotifications(options: NotificationOptions, listener: NotificationListener): () => void {
         const device = this.ensureConnected();
         const key = this.getNotificationKey(options);
+        this.stopNotifications(options);
+        logService('开始订阅通知', {
+            deviceId: device.id,
+            serviceUUID: options.serviceUUID,
+            characteristicUUID: options.characteristicUUID,
+        });
 
         // 监听特征值变化
         const subscription = device.monitorCharacteristicForService(
@@ -358,10 +510,32 @@ class BluetoothService {
             options.characteristicUUID,
             (error, characteristic) => {
                 if (error) {
-                    console.error('BLE notification error:', error);
+                    const isExpectedCancellation =
+                        error.errorCode === BleErrorCode.OperationCancelled ||
+                        /cancelled|canceled/i.test(error.message ?? '');
+
+                    if (isExpectedCancellation) {
+                        warnService('通知订阅被取消', {
+                            serviceUUID: options.serviceUUID,
+                            characteristicUUID: options.characteristicUUID,
+                        });
+                    } else {
+                        errorService('通知监听出错', error);
+                    }
                     return;
                 }
                 if (characteristic?.value) {
+                    let preview = characteristic.value;
+                    try {
+                        preview = sanitizeTextPreview(base64.decode(characteristic.value));
+                    } catch {
+                        preview = sanitizeTextPreview(characteristic.value);
+                    }
+                    logService('收到通知数据', {
+                        serviceUUID: options.serviceUUID,
+                        characteristicUUID: options.characteristicUUID,
+                        preview,
+                    });
                     listener(characteristic.value);
                 }
             },
@@ -380,6 +554,7 @@ class BluetoothService {
     stopNotifications(options?: NotificationOptions): void {
         try {
             if (!this.connectedDevice) {
+                logService('当前没有连接设备，跳过取消通知');
                 // console.log('🟡 skip stopNotifications: no connected device');
                 return;
             }
@@ -389,10 +564,11 @@ class BluetoothService {
                     try {
                         subscription?.remove?.();
                     } catch (e) {
-                        console.warn('BLE stopNotifications: remove failed', e);
+                        warnService('移除通知订阅失败', e);
                     }
                 });
                 this.notificationSubscriptions.clear();
+                logService('已取消全部通知订阅');
                 return;
             }
 
@@ -402,12 +578,16 @@ class BluetoothService {
                 try {
                     subscription?.remove?.();
                 } catch (e) {
-                    console.warn('BLE stopNotifications: single remove failed', e);
+                    warnService('移除单个通知订阅失败', e);
                 }
                 this.notificationSubscriptions.delete(key);
+                logService('已取消指定通知订阅', {
+                    serviceUUID: options.serviceUUID,
+                    characteristicUUID: options.characteristicUUID,
+                });
             }
         } catch (error) {
-            console.warn('BLE stopNotifications global error:', error);
+            warnService('取消通知订阅失败', error);
         }
     }
 
@@ -424,6 +604,12 @@ class BluetoothService {
     ): Promise<void> {
         const device = this.ensureConnected();
         const data = this.toBase64(rawData);
+        logService('开始写入数据（有响应）', {
+            deviceId: device.id,
+            serviceUUID: options.serviceUUID,
+            characteristicUUID: options.characteristicUUID,
+            payload: formatPayloadSummary(rawData),
+        });
 
         // console.log('🔍 发送数据详情:', {
         //   serviceUUID: options.serviceUUID,
@@ -441,14 +627,54 @@ class BluetoothService {
                 options.characteristicUUID,
                 data,
             );
+            logService('写入数据成功（有响应）', {
+                deviceId: device.id,
+                characteristicUUID: options.characteristicUUID,
+            });
             // console.log('✅ 数据发送成功 (WithResponse)');
         } catch (error: any) {
-            console.error('❌ 发送数据失败 (WithResponse):', {
+            errorService('写入数据失败（有响应）', {
                 error: error.message,
                 reason: error.reason,
                 errorCode: error.errorCode,
                 serviceUUID: options.serviceUUID,
                 characteristicUUID: options.characteristicUUID,
+            });
+            throw error;
+        }
+    }
+
+    /**
+     * 向特征值写入数据并返回设备响应文本。
+     *
+     * 优先使用 write-with-response 返回的 characteristic value；如果返回为空，
+     * 则回退到主动 read 同一个特征值，读取固件缓存的最近一次响应。
+     */
+    async sendRequest(
+        options: NotificationOptions,
+        rawData: Uint8Array | string,
+    ): Promise<string> {
+        const device = this.ensureConnected();
+        const data = this.toBase64(rawData);
+
+        try {
+            const characteristic = await device.writeCharacteristicWithResponseForService(
+                options.serviceUUID,
+                options.characteristicUUID,
+                data,
+            );
+
+            if (characteristic?.value) {
+                return base64.decode(characteristic.value);
+            }
+
+            return await this.readCharacteristic(options);
+        } catch (error) {
+            errorService('请求-响应写入失败', {
+                serviceUUID: options.serviceUUID,
+                characteristicUUID: options.characteristicUUID,
+                payload: formatPayloadSummary(rawData),
+                error,
             });
             throw error;
         }
@@ -467,6 +693,12 @@ class BluetoothService {
     ): Promise<void> {
         const device = this.ensureConnected();
         const data = this.toBase64(rawData);
+        logService('开始写入数据（无响应）', {
+            deviceId: device.id,
+            serviceUUID: options.serviceUUID,
+            characteristicUUID: options.characteristicUUID,
+            payload: formatPayloadSummary(rawData),
+        });
 
         // console.log('🔍 发送数据详情 (NoResponse):', {
         //   serviceUUID: options.serviceUUID,
@@ -484,9 +716,13 @@ class BluetoothService {
                 options.characteristicUUID,
                 data,
             );
+            logService('写入数据成功（无响应）', {
+                deviceId: device.id,
+                characteristicUUID: options.characteristicUUID,
+            });
             // console.log('✅ 数据发送成功 (WithoutResponse)');
         } catch (error: any) {
-            console.error('❌ 发送数据失败 (WithoutResponse):', {
+            errorService('写入数据失败（无响应）', {
                 error: error.message,
                 reason: error.reason,
                 errorCode: error.errorCode,
@@ -506,6 +742,11 @@ class BluetoothService {
      */
     async readCharacteristic(options: NotificationOptions): Promise<string> {
         const device = this.ensureConnected();
+        logService('开始读取特征值', {
+            deviceId: device.id,
+            serviceUUID: options.serviceUUID,
+            characteristicUUID: options.characteristicUUID,
+        });
         const characteristic = await device.readCharacteristicForService(
             options.serviceUUID,
             options.characteristicUUID,
@@ -515,7 +756,13 @@ class BluetoothService {
             throw new Error('Characteristic returned empty value');
         }
 
-        return base64.decode(characteristic.value);
+        const decoded = base64.decode(characteristic.value);
+        logService('读取特征值成功', {
+            characteristicUUID: options.characteristicUUID,
+            preview: sanitizeTextPreview(decoded),
+        });
+
+        return decoded;
     }
 
     /**
@@ -547,9 +794,11 @@ class BluetoothService {
                     characteristicUUID,
                 });
             } catch (error) {
-                console.warn(`Failed to read device info field ${field}:`, error);
+                warnService(`读取设备信息字段失败: ${field}`, error);
             }
         }
+
+        logService('设备信息读取完成', result);
 
         return result;
     }
@@ -566,9 +815,13 @@ class BluetoothService {
      */
     private handleConnectedDevice(device: Device) {
         this.disconnectSubscription?.remove();
+        logService('已注册断开连接监听', formatDeviceSummary(device));
 
         this.disconnectSubscription = device.onDisconnected((error, disconnectedDevice) => {
-            // console.log('BLE device disconnected:', error, disconnectedDevice);
+            warnService('设备连接已断开', {
+                error: error?.message ?? null,
+                device: formatDeviceSummary(disconnectedDevice ?? device),
+            });
             this.isDisconnecting = true;
             this.connectedDevice = null;
             // 使用 forEach 避免对 Set 进行 for-of 迭代导致的 downlevelIteration 要求
@@ -576,7 +829,7 @@ class BluetoothService {
                 try {
                     listener(disconnectedDevice);
                 } catch (e) {
-                    console.error(e);
+                    errorService('断开连接监听回调执行失败', e);
                 }
             });
         });
@@ -597,7 +850,7 @@ class BluetoothService {
         // });
 
         if (!this.connectedDevice) {
-            console.error('❌ ensureConnected: 设备未连接');
+            errorService('当前没有可用的已连接设备');
             throw new Error('Device not connected');
         }
 
@@ -642,6 +895,7 @@ class BluetoothService {
      */
     private async ensurePermissions(): Promise<void> {
         if (Platform.OS !== 'android') {
+            logService('非 Android 平台，跳过蓝牙权限申请', { platform: Platform.OS });
             return;
         }
 
@@ -651,6 +905,7 @@ class BluetoothService {
                 : parseInt(String(Platform.Version), 10);
 
         if (apiLevel >= 31) {
+            logService('开始申请 Android 蓝牙权限', { apiLevel });
             // Android 12+ 需要新的蓝牙权限
             const permissions = [
                 PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
@@ -664,17 +919,22 @@ class BluetoothService {
                 .map(([permission]) => permission);
 
             if (denied.length > 0) {
+                warnService('Android 蓝牙权限被拒绝', { denied });
                 throw new Error(`Bluetooth permissions denied: ${denied.join(', ')}`);
             }
+            logService('Android 蓝牙权限申请完成', { permissions });
         } else {
+            logService('开始申请 Android 定位权限', { apiLevel });
             // Android 11 及以下版本只需要位置权限
             const result = await PermissionsAndroid.request(
                 PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
             );
 
             if (result !== PermissionsAndroid.RESULTS.GRANTED) {
+                warnService('Android 定位权限被拒绝');
                 throw new Error('Location permission denied');
             }
+            logService('Android 定位权限申请完成');
         }
     }
 
@@ -691,6 +951,7 @@ class BluetoothService {
     private async ensureBluetoothEnabled(): Promise<void> {
         if (Platform.OS === 'ios') {
             const initialState = await this.manager.state();
+            logService('检查 iOS 蓝牙状态', { initialState });
             if (initialState === 'PoweredOn') {
                 return;
             }
@@ -698,6 +959,7 @@ class BluetoothService {
             // iOS 需要等待蓝牙状态变化
             await new Promise<void>((resolve, reject) => {
                 const subscription = this.manager.onStateChange((state) => {
+                    logService('iOS 蓝牙状态变化', { state });
                     if (state === 'PoweredOn') {
                         subscription.remove();
                         resolve();
@@ -713,6 +975,7 @@ class BluetoothService {
 
         // Android 直接检查蓝牙状态
         const state = await this.manager.state();
+        logService('检查 Android 蓝牙状态', { state });
         if (state !== 'PoweredOn') {
             // 移除 Alert，改为抛出错误
             throw new Error(`Bluetooth state: ${state}`);

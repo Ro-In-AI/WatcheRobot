@@ -8,7 +8,7 @@ interface BluetoothComponentProps {
 /**
 * Bluetooth 模块的示例组件
 */
-export const BluetoothComponent: React.FC<BluetoothComponentProps> = (props) => {
+export const BluetoothComponent: React.FC<BluetoothComponentProps> = () => {
     return (
         <View style={styles.container}>
             <Text>Bluetooth Component</Text>

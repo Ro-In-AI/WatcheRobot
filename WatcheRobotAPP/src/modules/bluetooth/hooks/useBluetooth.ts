@@ -1,624 +1,980 @@
-import { useCallback, useRef } from 'react';
-import { Platform } from 'react-native';
-import { bluetoothService } from '../services/bluetoothService';
-import {
-    BluetoothStatus,
-    BluetoothDeviceInfo,
-    BluetoothError,
-    BluetoothReceivedData,
-    ScanOptions,
-    ConnectOptions,
-    NotificationOptions,
-    DeviceDiscoveredCallback,
-    NotificationListener,
-    DisconnectListener,
-    SendCommandOptions,
-    UseBluetoothReturn,
-} from '../types';
-import bleConfig from '../config/ble_config.json';
-import base64 from 'react-native-base64';
+import {useCallback, useRef} from 'react';
+import {Platform} from 'react-native';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { useDispatch, useSelector } from 'react-redux';
+import base64 from 'react-native-base64';
+import {useDispatch, useSelector} from 'react-redux';
+import bleConfig from '../config/ble_config.json';
 import {
-    setStatus,
-    setDeviceInfo,
-    setError,
-    setReceivedData,
-    clearAll,
-    selectBluetoothState,
+  BLUETOOTH_DEFAULT_CONFIG,
+  BLUETOOTH_UUIDS,
+} from '../constants/bluetoothConstants';
+import {
+  BLE_PROTOCOL_TYPES,
+  BleProtocolNackError,
+  assertAckForCommand,
+  assertPongMessage,
+  buildAiStatusCommand,
+  buildPingCommand,
+  buildRobotStateSetCommand,
+  buildServoAngleCommand,
+  buildWifiClearCommand,
+  buildWifiGetCommand,
+  buildWifiSetCommand,
+  encodeBleProtocolMessage,
+  isNackMessage,
+  isAckMessage,
+  isWifiStatusMessage,
+  parseBleProtocolMessage,
+  tryParseBleProtocolMessage,
+  type BleProtocolMessage,
+  type BleWifiStatusMessage,
+} from '../protocol/bleProtocol';
+import {bluetoothService} from '../services/bluetoothService';
+import {
+  type BluetoothReceivedData,
+  BluetoothStatus,
+  type ConnectOptions,
+  type DeviceDiscoveredCallback,
+  type NotificationListener,
+  type NotificationOptions,
+  type ProtocolMessageListener,
+  type ScanOptions,
+  type UseBluetoothReturn,
+  type WifiProvisioningStatus,
+} from '../types';
+import {
+  selectBluetoothState,
+  setDeviceInfo,
+  setError,
+  setReceivedData,
+  setStatus,
 } from '../store';
+import {STORAGE_KEYS} from '../../../utils/storageKeys';
 
-/**
- * 蓝牙功能自定义 Hook
- *
- * 封装了蓝牙服务的所有功能，并集成了 Redux 状态管理。
- * 提供给 UI 组件使用的统一接口。
- *
- * @category Hooks
- *
- * @example
- * ```typescript
- * function MyComponent() {
- *   const { 
- *     status, 
- *     deviceInfo, 
- *     startScan, 
- *     connectToDevice,
- *     disconnect 
- *   } = useBluetooth();
- *
- *   // 扫描并连接
- *   const handleScan = async () => {
- *     await startScan((device) => {
- *       if (device.name === 'MyDevice') {
- *         connectToDevice(device.id);
- *       }
- *     });
- *   };
- *
- *   return (
- *     <View>
- *       <Text>状态: {status}</Text>
- *       {deviceInfo && <Text>已连接: {deviceInfo.name}</Text>}
- *       <Button title="扫描" onPress={handleScan} />
- *       <Button title="断开" onPress={disconnect} />
- *     </View>
- *   );
- * }
- * ```
- */
+const PROTOCOL_NOTIFICATION_OPTIONS: NotificationOptions = {
+  serviceUUID: BLUETOOTH_UUIDS.SERVICE_UUID,
+  characteristicUUID: BLUETOOTH_UUIDS.PROTOCOL_IO,
+};
+
+const HOOK_LOG_PREFIX = '[蓝牙][Hook]';
+
+const logHook = (message: string, details?: unknown) => {
+  if (details !== undefined) {
+    console.log(HOOK_LOG_PREFIX, message, details);
+    return;
+  }
+
+  console.log(HOOK_LOG_PREFIX, message);
+};
+
+const warnHook = (message: string, details?: unknown) => {
+  if (details !== undefined) {
+    console.warn(HOOK_LOG_PREFIX, message, details);
+    return;
+  }
+
+  console.warn(HOOK_LOG_PREFIX, message);
+};
+
+const summarizeProtocolMessage = (message: BleProtocolMessage) => ({
+  type: message.type,
+  code: message.code,
+  commandId: 'command_id' in message.data ? message.data.command_id : undefined,
+  data: message.data,
+});
+
+const getCharacteristicName = (options: NotificationOptions) => {
+  const service = bleConfig.services.find(
+    item => item.uuid.toLowerCase() === options.serviceUUID.toLowerCase(),
+  );
+  const characteristic = service?.characteristics.find(
+    item => item.uuid.toLowerCase() === options.characteristicUUID.toLowerCase(),
+  );
+
+  return characteristic?.name ?? 'Unknown';
+};
+
+const toReceivedData = (
+  message: unknown,
+  options: NotificationOptions,
+): BluetoothReceivedData => ({
+  characteristicName: getCharacteristicName(options),
+  characteristicUUID: options.characteristicUUID,
+  data: message,
+  timestamp: new Date().toISOString(),
+});
+
+const decodeNotificationText = (value: string | BluetoothReceivedData) => {
+  if (typeof value === 'string') {
+    return base64.decode(value);
+  }
+
+  if (typeof value.data === 'string') {
+    return value.data;
+  }
+
+  return '';
+};
+
+export const toWifiProvisioningStatus = (
+  message: BleWifiStatusMessage,
+): WifiProvisioningStatus => {
+  const {status, ssid, ip} = message.data;
+
+  return {
+    state: status,
+    message:
+      status === 'connected'
+        ? `Watcher connected to ${ssid ?? 'Wi-Fi'}`
+        : status === 'connecting'
+          ? `Watcher is connecting to ${ssid ?? 'Wi-Fi'}`
+          : status === 'disconnected'
+            ? `Watcher disconnected from ${ssid ?? 'Wi-Fi'}`
+            : 'Watcher is waiting for Wi-Fi credentials.',
+    raw: JSON.stringify(message),
+    ssid,
+    ip,
+  };
+};
+
+const clampAngle = (value: number) =>
+  Math.max(0, Math.min(180, value));
+
 export const useBluetooth = (): UseBluetoothReturn => {
-    // 使用 Redux 状态管理
-    const dispatch = useDispatch();
-    const { status, deviceInfo, receivedData, error } = useSelector(selectBluetoothState);
+  const dispatch = useDispatch();
+  const {status, deviceInfo, receivedData, error} =
+    useSelector(selectBluetoothState);
+  const protocolMessageListenersRef = useRef<Set<ProtocolMessageListener>>(
+    new Set(),
+  );
+  const protocolNotificationCleanupRef = useRef<(() => void) | null>(null);
+  const protocolSequenceRef = useRef(0);
+  const latestWifiStatusRef = useRef<{
+    sequence: number;
+    status: WifiProvisioningStatus;
+  } | null>(null);
+  const autoRescanConfigRef = useRef<{
+    scanTimeout: number;
+    connectTimeout: number;
+    autoConnect: boolean;
+    enableAutoRescan: boolean;
+    maxRescanAttempts: number;
+    rescanDelayMs: number;
+    currentAttempts: number;
+  } | null>(null);
 
-    // 自动重新扫描配置的 ref
-    const autoRescanConfigRef = useRef<{
-        scanTimeout: number;
-        connectTimeout: number;
-        autoConnect: boolean;
-        enableAutoRescan: boolean;
-        maxRescanAttempts: number;
-        rescanDelayMs: number;
-        currentAttempts: number;
-    } | null>(null);
+  const dispatchProtocolMessage = useCallback(
+    (message: BleProtocolMessage, options: NotificationOptions = PROTOCOL_NOTIFICATION_OPTIONS) => {
+      protocolSequenceRef.current += 1;
+      if (isWifiStatusMessage(message)) {
+        latestWifiStatusRef.current = {
+          sequence: protocolSequenceRef.current,
+          status: toWifiProvisioningStatus(message),
+        };
+      }
 
-    // 扫描超时定时器 ref
-    const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+      logHook('分发协议消息到 Redux', {
+        source: {
+          serviceUUID: options.serviceUUID,
+          characteristicUUID: options.characteristicUUID,
+        },
+        message: summarizeProtocolMessage(message),
+      });
+      dispatch(setReceivedData(toReceivedData(message, options)));
+    },
+    [dispatch],
+  );
 
-    /**
-     * 初始化蓝牙服务
-     */
-    const initialize = useCallback(async () => {
-        try {
-            await bluetoothService.initialize();
-        } catch (err: any) {
-            dispatch(
-                setError({
-                    message: err.message || 'Bluetooth initialization failed',
-                }),
+  const initialize = useCallback(async () => {
+    try {
+      await bluetoothService.initialize();
+    } catch (err: any) {
+      dispatch(
+        setError({
+          message: err.message || 'Bluetooth initialization failed',
+        }),
+      );
+    }
+  }, [dispatch]);
+
+  const startScan = useCallback(
+    async (onDeviceFound: DeviceDiscoveredCallback, options?: ScanOptions) => {
+      try {
+        await bluetoothService.initialize();
+        dispatch(setStatus(BluetoothStatus.Scanning));
+        dispatch(setError(null));
+        await bluetoothService.startScan(onDeviceFound, options);
+      } catch (err: any) {
+        dispatch(setStatus(BluetoothStatus.Error));
+        dispatch(
+          setError({
+            message: err.message || 'Scan failed',
+          }),
+        );
+      }
+    },
+    [dispatch],
+  );
+
+  const stopScan = useCallback(async () => {
+    bluetoothService.stopScan();
+    if (status === BluetoothStatus.Scanning) {
+      dispatch(setStatus(BluetoothStatus.Idle));
+    }
+  }, [dispatch, status]);
+
+  const connectToDevice = useCallback(
+    async (deviceId: string, options?: ConnectOptions) => {
+      try {
+        dispatch(setStatus(BluetoothStatus.Connecting));
+        dispatch(setError(null));
+
+        const device = await bluetoothService.connectToDevice(deviceId, options);
+        await AsyncStorage.setItem(STORAGE_KEYS.lastConnectedDeviceId, device.id);
+
+        dispatch(setStatus(BluetoothStatus.Connected));
+        dispatch(
+          setDeviceInfo({
+            id: device.id,
+            name: device.name,
+            mtu: device.mtu,
+          }),
+        );
+
+        bluetoothService.setOnDisconnectedListener(() => {
+          dispatch(setStatus(BluetoothStatus.Disconnected));
+          dispatch(setDeviceInfo(null));
+          dispatch(setReceivedData(null));
+        });
+      } catch (err: any) {
+        dispatch(setStatus(BluetoothStatus.Error));
+        dispatch(
+          setError({
+            message: err.message || 'Connection failed',
+          }),
+        );
+        throw err;
+      }
+    },
+    [dispatch],
+  );
+
+  const disconnect = useCallback(async () => {
+    try {
+      await bluetoothService.disconnectDevice();
+      dispatch(setStatus(BluetoothStatus.Disconnected));
+      dispatch(setDeviceInfo(null));
+      dispatch(setReceivedData(null));
+    } catch {
+      // Ignore disconnect cleanup failures.
+    }
+  }, [dispatch]);
+
+  const writeData = useCallback(
+    async (
+      serviceUUID: string,
+      characteristicUUID: string,
+      data: string | Uint8Array,
+      withResponse: boolean = false,
+    ) => {
+      try {
+        const options: NotificationOptions = {
+          serviceUUID,
+          characteristicUUID,
+        };
+
+        if (withResponse) {
+          await bluetoothService.sendDataWithResponse(options, data);
+        } else {
+          await bluetoothService.sendDataWithoutResponse(options, data);
+        }
+      } catch (err: any) {
+        dispatch(
+          setError({
+            message: err.message || 'Write data failed',
+          }),
+        );
+        throw err;
+      }
+    },
+    [dispatch],
+  );
+
+  const readData = useCallback(
+    async (serviceUUID: string, characteristicUUID: string) => {
+      try {
+        return await bluetoothService.readCharacteristic({
+          serviceUUID,
+          characteristicUUID,
+        });
+      } catch (err: any) {
+        dispatch(
+          setError({
+            message: err.message || 'Read data failed',
+          }),
+        );
+        throw err;
+      }
+    },
+    [dispatch],
+  );
+
+  const subscribeToNotifications = useCallback(
+    (options: NotificationOptions, callback: NotificationListener) => {
+      try {
+        return bluetoothService.startNotifications(options, value => {
+          let processedData: unknown = value;
+
+          if (typeof value === 'string') {
+            processedData = base64.decode(value);
+          }
+
+          logHook('收到原始通知并准备回调分发', {
+            serviceUUID: options.serviceUUID,
+            characteristicUUID: options.characteristicUUID,
+            processedData,
+          });
+
+          const nextReceivedData = toReceivedData(processedData, options);
+          dispatch(setReceivedData(nextReceivedData));
+          callback(nextReceivedData);
+        });
+      } catch (err: any) {
+        dispatch(
+          setError({
+            message: err.message || 'Subscribe notifications failed',
+          }),
+        );
+        return () => {};
+      }
+    },
+    [dispatch],
+  );
+
+  const ensureProtocolNotificationSubscription = useCallback(() => {
+    if (protocolNotificationCleanupRef.current) {
+      return;
+    }
+
+    logHook('建立底层协议通知订阅');
+    protocolNotificationCleanupRef.current = subscribeToNotifications(
+      PROTOCOL_NOTIFICATION_OPTIONS,
+      value => {
+        const raw = decodeNotificationText(value);
+        logHook('收到协议通知原文', {raw});
+        const parsed = tryParseBleProtocolMessage(raw);
+
+        if (!parsed) {
+          warnHook('协议通知解析失败，已忽略', {raw});
+          return;
+        }
+
+        dispatchProtocolMessage(parsed);
+        logHook('协议通知解析成功，准备执行监听器', {
+          listenerCount: protocolMessageListenersRef.current.size,
+          message: summarizeProtocolMessage(parsed),
+        });
+
+        protocolMessageListenersRef.current.forEach(listener => {
+          try {
+            listener(parsed);
+          } catch (error) {
+            warnHook('协议监听器执行失败', {error});
+          }
+        });
+      },
+    );
+  }, [dispatchProtocolMessage, subscribeToNotifications]);
+
+  const maybeStopProtocolNotificationSubscription = useCallback(() => {
+    if (
+      protocolMessageListenersRef.current.size > 0 ||
+      !protocolNotificationCleanupRef.current
+    ) {
+      return;
+    }
+
+    logHook('移除底层协议通知订阅');
+    protocolNotificationCleanupRef.current();
+    protocolNotificationCleanupRef.current = null;
+  }, []);
+
+  const subscribeToProtocolMessages = useCallback(
+    (callback: ProtocolMessageListener) => {
+      protocolMessageListenersRef.current.add(callback);
+      logHook('注册协议消息监听器', {
+        listenerCount: protocolMessageListenersRef.current.size,
+      });
+      ensureProtocolNotificationSubscription();
+
+      return () => {
+        protocolMessageListenersRef.current.delete(callback);
+        logHook('注销协议消息监听器', {
+          listenerCount: protocolMessageListenersRef.current.size,
+        });
+        maybeStopProtocolNotificationSubscription();
+      };
+    },
+    [
+      ensureProtocolNotificationSubscription,
+      maybeStopProtocolNotificationSubscription,
+    ],
+  );
+
+  const ensureConnected = useCallback(async () => {
+    if (status !== BluetoothStatus.Connected || !deviceInfo) {
+      throw new Error('Bluetooth device is not connected.');
+    }
+
+    const stillConnected = await bluetoothService.isDeviceConnected(deviceInfo.id);
+
+    if (!stillConnected) {
+      dispatch(setStatus(BluetoothStatus.Disconnected));
+      dispatch(setDeviceInfo(null));
+      throw new Error('The BLE device disconnected.');
+    }
+  }, [deviceInfo, dispatch, status]);
+
+  const readCachedProtocolMessage = useCallback(async () => {
+    logHook('开始读取缓存协议消息');
+    const raw = await bluetoothService.readCharacteristic(
+      PROTOCOL_NOTIFICATION_OPTIONS,
+    );
+    logHook('读取到缓存协议原文', {raw});
+    const parsed = tryParseBleProtocolMessage(raw);
+
+    if (parsed) {
+      dispatchProtocolMessage(parsed);
+      logHook('缓存协议消息解析成功', {
+        message: summarizeProtocolMessage(parsed),
+      });
+    } else {
+      warnHook('缓存协议消息解析失败', {raw});
+    }
+
+    return parsed;
+  }, [dispatchProtocolMessage]);
+
+  const waitForWifiStatus = useCallback(
+    (
+      timeoutMs: number = BLUETOOTH_DEFAULT_CONFIG.PROTOCOL_RESPONSE_TIMEOUT,
+      preferredStates?: WifiProvisioningStatus['state'][],
+      minSequence: number = 0,
+    ) =>
+      new Promise<WifiProvisioningStatus | null>(resolve => {
+        let settled = false;
+        const currentWifiStatus = latestWifiStatusRef.current;
+        let latestStatus: WifiProvisioningStatus | null =
+          currentWifiStatus && currentWifiStatus.sequence >= minSequence
+            ? currentWifiStatus.status
+            : null;
+        logHook('开始等待 Wi-Fi 状态通知', {timeoutMs});
+
+        if (
+          latestStatus &&
+          (!preferredStates?.length ||
+            preferredStates.includes(latestStatus.state))
+        ) {
+          logHook('命中已缓存的 Wi-Fi 状态，直接返回', {
+            minSequence,
+            preferredStates,
+            latestStatus,
+          });
+          resolve(latestStatus);
+          return;
+        }
+
+        const finalize = () => {
+          if (settled) {
+            return;
+          }
+
+          settled = true;
+          clearTimeout(timeoutId);
+          unsubscribe();
+          resolve(latestStatus);
+        };
+
+        const timeoutId = setTimeout(() => {
+          warnHook('等待 Wi-Fi 状态通知超时', {timeoutMs});
+          finalize();
+        }, timeoutMs);
+
+        const unsubscribe = subscribeToProtocolMessages(message => {
+          if (!isWifiStatusMessage(message) || settled) {
+            return;
+          }
+
+          latestStatus = toWifiProvisioningStatus(message);
+          logHook('收到 Wi-Fi 状态通知', {
+            message: summarizeProtocolMessage(message),
+            preferredStates,
+            minSequence,
+          });
+
+          if (
+            !preferredStates?.length ||
+            preferredStates.includes(latestStatus.state)
+          ) {
+            finalize();
+          }
+        });
+      }),
+    [subscribeToProtocolMessages],
+  );
+
+  const resolveWifiOperationStatus = useCallback(
+    async (
+      response: BleProtocolMessage,
+      expectedType:
+        | typeof BLE_PROTOCOL_TYPES.wifiGet
+        | typeof BLE_PROTOCOL_TYPES.wifiClear,
+      preferredStates?: WifiProvisioningStatus['state'][],
+      minSequence: number = 0,
+    ) => {
+      let immediateStatus: WifiProvisioningStatus | null = null;
+
+      if (isWifiStatusMessage(response)) {
+        immediateStatus = toWifiProvisioningStatus(response);
+        logHook('Wi-Fi 操作收到即时状态响应', {
+          expectedType,
+          response: summarizeProtocolMessage(response),
+        });
+      } else if (isAckMessage(response)) {
+        if (response.data.type !== expectedType) {
+          warnHook('Wi-Fi 操作 ACK 类型异常，继续等待状态通知', {
+            expectedType,
+            ackType: response.data.type,
+            response: summarizeProtocolMessage(response),
+          });
+        }
+      } else if (response.type === expectedType) {
+        logHook('Wi-Fi 操作收到请求回显，继续等待状态通知', {
+          expectedType,
+          response: summarizeProtocolMessage(response),
+        });
+      } else {
+        warnHook('Wi-Fi 操作收到非预期同步响应，继续等待状态通知', {
+          expectedType,
+          response: summarizeProtocolMessage(response),
+        });
+      }
+
+      const notifiedStatus = await waitForWifiStatus(
+        BLUETOOTH_DEFAULT_CONFIG.PROTOCOL_RESPONSE_TIMEOUT,
+        preferredStates,
+        minSequence,
+      );
+      if (notifiedStatus) {
+        return notifiedStatus;
+      }
+
+      const fallbackMessage = await readCachedProtocolMessage();
+      if (fallbackMessage && isWifiStatusMessage(fallbackMessage)) {
+        return toWifiProvisioningStatus(fallbackMessage);
+      }
+
+      return immediateStatus;
+    },
+    [readCachedProtocolMessage, waitForWifiStatus],
+  );
+
+  const sendProtocolRequest = useCallback(
+    async (request: BleProtocolMessage) => {
+      try {
+        await ensureConnected();
+        dispatch(setError(null));
+        logHook('发送协议请求', {
+          request: summarizeProtocolMessage(request),
+        });
+
+        const rawResponse = await bluetoothService.sendRequest(
+          PROTOCOL_NOTIFICATION_OPTIONS,
+          encodeBleProtocolMessage(request),
+        );
+        logHook('收到协议响应原文', {
+          requestType: request.type,
+          rawResponse,
+        });
+        const parsedResponse = parseBleProtocolMessage(rawResponse);
+
+        dispatchProtocolMessage(parsedResponse);
+        logHook('协议响应解析成功', {
+          requestType: request.type,
+          response: summarizeProtocolMessage(parsedResponse),
+        });
+
+        if (isNackMessage(parsedResponse)) {
+          warnHook('收到协议 NACK', {
+            requestType: request.type,
+            response: summarizeProtocolMessage(parsedResponse),
+          });
+          throw new BleProtocolNackError(parsedResponse);
+        }
+
+        return parsedResponse;
+      } catch (err: any) {
+        dispatch(
+          setError({
+            message:
+              err instanceof Error ? err.message : 'Failed to send BLE request',
+          }),
+        );
+        throw err;
+      }
+    },
+    [dispatch, dispatchProtocolMessage, ensureConnected],
+  );
+
+  const connectToConfiguredDevice = useCallback(
+    async (options?: {
+      deviceName?: string;
+      scanTimeout?: number;
+      connectTimeout?: number;
+      autoConnect?: boolean;
+      enableAutoRescan?: boolean;
+      maxRescanAttempts?: number;
+      rescanDelayMs?: number;
+    }) => {
+      const adapterState = await bluetoothService.getAdapterState();
+
+      if (Platform.OS === 'ios') {
+        if (adapterState !== 'PoweredOn') {
+          await new Promise<void>((resolve, reject) => {
+            const subscription = (bluetoothService as any).manager.onStateChange(
+              (state: string) => {
+                if (state === 'PoweredOn') {
+                  subscription.remove();
+                  resolve();
+                } else if (state === 'PoweredOff' || state === 'Unauthorized') {
+                  subscription.remove();
+                  reject(new Error('Bluetooth is unavailable on this iPhone.'));
+                }
+              },
+              true,
             );
+          });
         }
-    }, [dispatch]);
+      } else if (adapterState !== 'PoweredOn') {
+        throw new Error('Bluetooth is turned off.');
+      }
 
-    /**
-     * 开始扫描设备
-     *
-     * @param {DeviceDiscoveredCallback} onDeviceFound - 发现设备时的回调
-     * @param {ScanOptions} [options] - 扫描选项
-     */
-    const startScan = useCallback(
-        async (onDeviceFound: DeviceDiscoveredCallback, options?: ScanOptions) => {
-            try {
-                dispatch(setStatus(BluetoothStatus.Scanning));
-                dispatch(setError(null));
+      const {
+        deviceName = bleConfig.ble_device_name,
+        scanTimeout = BLUETOOTH_DEFAULT_CONFIG.SCAN_TIMEOUT,
+        connectTimeout = BLUETOOTH_DEFAULT_CONFIG.CONNECT_TIMEOUT,
+        autoConnect = true,
+        enableAutoRescan = false,
+        maxRescanAttempts = BLUETOOTH_DEFAULT_CONFIG.MAX_RESCAN_ATTEMPTS,
+        rescanDelayMs = BLUETOOTH_DEFAULT_CONFIG.RESCAN_DELAY,
+      } = options || {};
 
-                await bluetoothService.startScan(onDeviceFound, options);
-            } catch (err: any) {
-                dispatch(setStatus(BluetoothStatus.Error));
-                dispatch(
-                    setError({
-                        message: err.message || 'Scan failed',
-                    }),
-                );
-            }
-        },
-        [dispatch],
-    );
+      autoRescanConfigRef.current = {
+        scanTimeout,
+        connectTimeout,
+        autoConnect,
+        enableAutoRescan,
+        maxRescanAttempts,
+        rescanDelayMs,
+        currentAttempts: 0,
+      };
 
-    /**
-     * 停止扫描
-     */
-    const stopScan = useCallback(async () => {
-        bluetoothService.stopScan();
-        if (status === BluetoothStatus.Scanning) {
-            dispatch(setStatus(BluetoothStatus.Idle));
-        }
-    }, [dispatch, status]);
-
-    /**
-     * 连接到设备
-     *
-     * @param {string} deviceId - 设备 ID
-     * @param {ConnectOptions} [options] - 连接选项
-     */
-    const connectToDevice = useCallback(
-        async (deviceId: string, options?: ConnectOptions) => {
-            try {
-                dispatch(setStatus(BluetoothStatus.Connecting));
-                dispatch(setError(null));
-
-                const device = await bluetoothService.connectToDevice(deviceId, options);
-
-                dispatch(setStatus(BluetoothStatus.Connected));
-                dispatch(
-                    setDeviceInfo({
-                        id: device.id,
-                        name: device.name,
-                        mtu: device.mtu,
-                    }),
-                );
-
-                // 设置断开连接监听
-                bluetoothService.setOnDisconnectedListener((disconnectedDevice) => {
-                    dispatch(setStatus(BluetoothStatus.Disconnected));
-                    dispatch(setDeviceInfo(null));
-                    // 可以在这里处理自动重连逻辑
-                });
-            } catch (err: any) {
-                dispatch(setStatus(BluetoothStatus.Error));
-                dispatch(
-                    setError({
-                        message: err.message || 'Connection failed',
-                    }),
-                );
-            }
-        },
-        [dispatch],
-    );
-
-    /**
-     * 断开连接
-     */
-    const disconnect = useCallback(async () => {
-        try {
-            await bluetoothService.disconnectDevice();
-            dispatch(setStatus(BluetoothStatus.Disconnected));
-            dispatch(setDeviceInfo(null));
-            dispatch(setReceivedData(null));
-        } catch (err: any) {
-            console.warn('Disconnect error:', err);
-        }
-    }, [dispatch]);
-
-    /**
-     * 发送数据
-     *
-     * @param {string} serviceUUID - 服务 UUID
-     * @param {string} characteristicUUID - 特征值 UUID
-     * @param {string | Uint8Array} data - 要发送的数据
-     * @param {boolean} [withResponse=false] - 是否需要响应
-     */
-    const writeData = useCallback(
-        async (
-            serviceUUID: string,
-            characteristicUUID: string,
-            data: string | Uint8Array,
-            withResponse: boolean = false,
-        ) => {
-            try {
-                const options: NotificationOptions = {
-                    serviceUUID,
-                    characteristicUUID,
-                };
-
-                if (withResponse) {
-                    await bluetoothService.sendDataWithResponse(options, data);
-                } else {
-                    await bluetoothService.sendDataWithoutResponse(options, data);
-                }
-            } catch (err: any) {
-                dispatch(
-                    setError({
-                        message: err.message || 'Write data failed',
-                    }),
-                );
-                throw err;
-            }
-        },
-        [dispatch],
-    );
-
-    /**
-     * 读取特征值数据
-     *
-     * @param {string} serviceUUID - 服务 UUID
-     * @param {string} characteristicUUID - 特征值 UUID
-     * @returns {Promise<string>} 读取到的数据 (Base64)
-     */
-    const readData = useCallback(
-        async (serviceUUID: string, characteristicUUID: string) => {
-            try {
-                const options: NotificationOptions = {
-                    serviceUUID,
-                    characteristicUUID,
-                };
-                return await bluetoothService.readCharacteristic(options);
-            } catch (err: any) {
-                dispatch(
-                    setError({
-                        message: err.message || 'Read data failed',
-                    }),
-                );
-                throw err;
-            }
-        },
-        [dispatch],
-    );
-
-    /**
-     * 订阅通知
-     *
-     * @param {NotificationOptions} options - 通知选项
-     * @param {NotificationListener} callback - 收到通知时的回调
-     * @returns {function} 取消订阅函数
-     */
-    const subscribeToNotifications = useCallback(
-        (options: NotificationOptions, callback: NotificationListener) => {
-            try {
-                return bluetoothService.startNotifications(options, (data) => {
-                    // 查找特征值配置
-                    let characteristicName = 'Unknown';
-                    let valueFormat = 'string';
-
-                    const service = bleConfig.services.find(s => s.uuid.toLowerCase() === options.serviceUUID.toLowerCase());
-                    if (service) {
-                        const char = service.characteristics.find(c => c.uuid.toLowerCase() === options.characteristicUUID.toLowerCase());
-                        if (char) {
-                            characteristicName = char.name;
-                            if (char.value_format) {
-                                valueFormat = char.value_format;
-                            }
-                        }
-                    }
-
-                    // 尝试解析数据
-                    let processedData: any = data;
-                    if (typeof data === 'string') {
-                        try {
-                            // 根据配置的格式进行解析
-                            if (valueFormat === 'bytes') {
-                                // Base64 转字节数组
-                                const binaryString = base64.decode(data);
-                                const bytes = new Uint8Array(binaryString.length);
-                                for (let i = 0; i < binaryString.length; i++) {
-                                    bytes[i] = binaryString.charCodeAt(i);
-                                }
-                                processedData = Array.from(bytes);
-                            } 
-                            // 未来可以扩展其他格式支持，如 'int', 'float' 等
-                        } catch (e) {
-                            console.warn('Data parse error:', e);
-                        }
-                    }
-
-                    const receivedDataObj: BluetoothReceivedData = {
-                        characteristicName,
-                        characteristicUUID: options.characteristicUUID,
-                        data: processedData,
-                        timestamp: new Date().toISOString(),
-                    };
-
-                    // 更新 Redux 状态中的接收数据
-                    dispatch(setReceivedData(receivedDataObj));
-                    // 调用用户回调
-                    callback(receivedDataObj);
-                });
-            } catch (err: any) {
-                dispatch(
-                    setError({
-                        message: err.message || 'Subscribe notifications failed',
-                    }),
-                );
-                return () => { };
-            }
-        },
-        [dispatch],
-    );
-
-    /**
-     * 连接到配置文件中指定的设备
-     *
-     * 自动扫描并连接到 ble_config.json 中配置的设备。
-     * 支持断开连接后自动重新扫描和连接功能。
-     */
-    const connectToConfiguredDevice = useCallback(
-        async (options?: {
-            deviceName?: string;
-            scanTimeout?: number;
-            connectTimeout?: number;
-            autoConnect?: boolean;
-            enableAutoRescan?: boolean;
-            maxRescanAttempts?: number;
-            rescanDelayMs?: number;
-        }) => {
-            // 确保蓝牙适配器已启用
-            const state = await bluetoothService.getAdapterState();
-
-            // iOS 平台需要等待状态变为 PoweredOn
-            if (Platform.OS === 'ios') {
-                if (state !== 'PoweredOn') {
-                    // 等待蓝牙状态变为 PoweredOn
-                    await new Promise<void>((resolve, reject) => {
-                        const subscription = (bluetoothService as any).manager.onStateChange(
-                            (newState: string) => {
-                                if (newState === 'PoweredOn') {
-                                    subscription.remove();
-                                    resolve();
-                                } else if (newState === 'PoweredOff' || newState === 'Unauthorized') {
-                                    subscription.remove();
-                                    reject(new Error('iOS 蓝牙权限被拒绝或未启用'));
-                                }
-                            },
-                            true,
-                        );
-                    });
-                }
-            } else {
-                // Android 直接检查状态
-                if (state !== 'PoweredOn') {
-                    throw new Error('手机蓝牙未开启');
-                }
-            }
-
-            const {
-                deviceName = bleConfig.ble_device_name,
-                scanTimeout = 10000,
-                connectTimeout = 15000,
-                autoConnect = true,
-                enableAutoRescan = false,
-                maxRescanAttempts = 5,
-                rescanDelayMs = 3000,
-            } = options || {};
-
-            autoRescanConfigRef.current = {
-                scanTimeout,
-                connectTimeout,
-                autoConnect,
-                enableAutoRescan,
-                maxRescanAttempts,
-                rescanDelayMs,
-                currentAttempts: 0,
-            };
-
-            /**
-             * 内部方法：执行一次扫描并连接逻辑
-             */
-            const performScanAndConnect = async () => {
-                try {
-                    await bluetoothService.initialize(); // 确保有权限
-                    dispatch(setError(null));
-
-                    if (status === BluetoothStatus.Scanning) {
-                        return;
-                    }
-
-                    dispatch(setStatus(BluetoothStatus.Scanning));
-
-                    let deviceFound = false;
-
-                    // 启动扫描
-                    const scanPromise = bluetoothService.startScan(
-                        async (device) => {
-                            if (device.name === deviceName) {
-                                deviceFound = true;
-                                await stopScan();
-
-                                try {
-                                    await connectToDevice(device.id, { timeout: connectTimeout, autoConnect });
-
-                                    if (autoRescanConfigRef.current) {
-                                        autoRescanConfigRef.current.currentAttempts = 0;
-                                    }
-                                    if (enableAutoRescan) setupAutoRescan();
-                                } catch (connectError) {
-                                    console.error('❌ 扫描中发现目标设备但连接失败:', connectError);
-                                    deviceFound = false;
-                                }
-                            }
-                        },
-                        { timeout: scanTimeout },
-                    );
-
-                    // 等待扫描完成（包括超时）
-                    await scanPromise;
-
-                    // 如果扫描结束但没有发现设备
-                    if (!deviceFound) {
-                        console.log('设备是 ', deviceName);
-                        console.warn('⏰ 扫描结束，未发现目标设备');
-                        await stopScan();
-                        dispatch(setStatus(BluetoothStatus.Error));
-                        dispatch(setError({ message: '未发现目标设备，请确认设备已开机并开启蓝牙广播' }));
-                    }
-                } catch (error) {
-                    console.error('❌ 扫描连接异常:', error);
-                    const msg = error instanceof Error ? error.message : '扫描连接设备失败';
-                    dispatch(setError({ message: msg }));
-                    dispatch(setStatus(BluetoothStatus.Error));
-                } finally {
-                    // 确保扫描被停止，防止 BLE 未释放导致系统 SIGKILL
-                    try {
-                        await stopScan();
-                    } catch {
-                        // 忽略异常
-                    }
-                }
-            };
-
-            /**
-             * 内部方法：自动重连逻辑
-             */
-            const setupAutoRescan = () => {
-                bluetoothService.setOnDisconnectedListener((device) => {
-                    dispatch(setStatus(BluetoothStatus.Disconnected));
-                    dispatch(setDeviceInfo(null));
-                    dispatch(setReceivedData(null));
-
-                    if (
-                        autoRescanConfigRef.current &&
-                        autoRescanConfigRef.current.currentAttempts <
-                        autoRescanConfigRef.current.maxRescanAttempts
-                    ) {
-                        autoRescanConfigRef.current.currentAttempts++;
-                        setTimeout(() => {
-                            performScanAndConnect().catch((error) => {
-                                console.error(
-                                    `第 ${autoRescanConfigRef.current?.currentAttempts} 次重新扫描失败:`,
-                                    error,
-                                );
-                                if (
-                                    autoRescanConfigRef.current &&
-                                    autoRescanConfigRef.current.currentAttempts >=
-                                    autoRescanConfigRef.current.maxRescanAttempts
-                                ) {
-                                    dispatch(setError({ message: '自动重新扫描失败，请手动重新连接' }));
-                                }
-                            });
-                        }, autoRescanConfigRef.current.rescanDelayMs);
-                    } else {
-                        dispatch(setError({ message: '自动重新扫描失败，请手动重新连接' }));
-                    }
-                });
-            };
-
-            /**
-             * 优先尝试从缓存中连接
-             */
-            try {
-                const lastId = await AsyncStorage.getItem('lastConnectedDeviceId');
-                if (lastId) {
-                    try {
-                        await connectToDevice(lastId, { timeout: connectTimeout, autoConnect });
-                        if (enableAutoRescan) setupAutoRescan();
-                        return; // 直接返回，跳过扫描
-                    } catch (err) {
-                        console.warn('⚠️ 缓存设备连接失败，清理缓存并按设备名称重新扫描连接', err);
-                        await AsyncStorage.removeItem('lastConnectedDeviceId');
-                    }
-                }
-
-                // 无缓存或连接失败则扫描连接
-                await performScanAndConnect();
-            } catch (err) {
-                console.error('❌ connectToConfiguredDevice 执行异常:', err);
-                dispatch(setError({ message: (err as Error).message }));
-                dispatch(setStatus(BluetoothStatus.Error));
-            }
-        },
-        [dispatch, status, stopScan, connectToDevice],
-    );
-
-    /**
-     * 发送命令到设备
-     *
-     * 向连接的蓝牙设备发送命令数据，支持有响应和无响应两种模式。
-     */
-    const sendCommand = useCallback(
-        async (options: SendCommandOptions) => {
-            const {
-                data,
-                serviceUUID = '00FF',
-                characteristicUUID = 'FF01',
-                type = 'no_response',
-            } = options;
-
-            try {
-                // 检查蓝牙连接状态
-                if (status !== BluetoothStatus.Connected || !deviceInfo) {
-                    throw new Error('蓝牙未连接');
-                }
-
-                // 检查设备是否真的连接
-                const isConnected = await bluetoothService.isDeviceConnected(deviceInfo.id);
-                if (!isConnected) {
-                    dispatch(setStatus(BluetoothStatus.Disconnected));
-                    dispatch(setDeviceInfo(null));
-                    throw new Error('设备已断开连接');
-                }
-
-                if (type === 'response') {
-                    await bluetoothService.sendDataWithResponse(
-                        {
-                            serviceUUID,
-                            characteristicUUID,
-                        },
-                        data,
-                    );
-                } else {
-                    await bluetoothService.sendDataWithoutResponse(
-                        {
-                            serviceUUID,
-                            characteristicUUID,
-                        },
-                        data,
-                    );
-                }
-            } catch (error) {
-                console.error('❌ 指令发送失败:', error);
-                // 如果是连接问题，更新状态
-                if (error instanceof Error && error.message.includes('not connected')) {
-                    dispatch(setStatus(BluetoothStatus.Disconnected));
-                    dispatch(setDeviceInfo(null));
-                }
-                const errorMessage = error instanceof Error ? error.message : '发送命令失败';
-                dispatch(setError({ message: errorMessage }));
-                dispatch(setStatus(BluetoothStatus.Error));
-                throw error; // 重新抛出错误，让调用者知道发送失败
-            }
-        },
-        [dispatch, status, deviceInfo],
-    );
-
-    /**
-     * 清除错误状态
-     */
-    const clearError = useCallback(() => {
+      const performScanAndConnect = async () => {
         dispatch(setError(null));
-        if (status === BluetoothStatus.Error) {
-            dispatch(setStatus(BluetoothStatus.Idle));
+        dispatch(setStatus(BluetoothStatus.Scanning));
+        let matchedDeviceId: string | null = null;
+
+        await bluetoothService.startScan(
+          async device => {
+            const localName = (device as any).localName;
+            if (device.name === deviceName || localName === deviceName) {
+              logHook('扫描命中默认目标设备', {
+                expectedDeviceName: deviceName,
+                matchedDevice: {
+                  id: device.id,
+                  name: device.name,
+                  localName,
+                  rssi: device.rssi,
+                },
+              });
+              matchedDeviceId = device.id;
+              await stopScan();
+            }
+          },
+          {timeout: scanTimeout},
+        );
+
+        if (!matchedDeviceId) {
+          dispatch(setStatus(BluetoothStatus.Error));
+          dispatch(
+            setError({
+              message: `Unable to find ${deviceName}. Make sure the device is powered on and advertising BLE.`,
+            }),
+          );
+          return;
         }
-    }, [dispatch, status]);
 
-    /**
-     * 清除所有蓝牙状态
-     */
-    const clearAll = useCallback(() => {
-        dispatch(setStatus(BluetoothStatus.Idle));
-        dispatch(setDeviceInfo(null));
-        dispatch(setReceivedData(null));
-        dispatch(setError(null));
-    }, [dispatch]);
+        logHook('扫描结束，准备连接命中的默认设备', {
+          matchedDeviceId,
+          deviceName,
+        });
+        await connectToDevice(matchedDeviceId, {
+          timeout: connectTimeout,
+          autoConnect,
+        });
+      };
 
-    return {
-        // 状态
-        status,
-        deviceInfo,
-        receivedData,
-        error,
+      const setupAutoRescan = () => {
+        bluetoothService.setOnDisconnectedListener(() => {
+          dispatch(setStatus(BluetoothStatus.Disconnected));
+          dispatch(setDeviceInfo(null));
+          dispatch(setReceivedData(null));
 
-        // 方法
-        initialize,
-        startScan,
-        stopScan,
-        connectToDevice,
-        connectToConfiguredDevice,
-        disconnect,
-        writeData,
-        readData,
-        subscribeToNotifications,
-        sendCommand,
-        clearError,
-        clearAll,
-    };
+          if (
+            autoRescanConfigRef.current &&
+            autoRescanConfigRef.current.enableAutoRescan &&
+            autoRescanConfigRef.current.currentAttempts <
+              autoRescanConfigRef.current.maxRescanAttempts
+          ) {
+            autoRescanConfigRef.current.currentAttempts += 1;
+            setTimeout(() => {
+              performScanAndConnect().catch(() => {
+                dispatch(
+                  setError({
+                    message: 'Auto reconnect failed. Please reconnect manually.',
+                  }),
+                );
+              });
+            }, autoRescanConfigRef.current.rescanDelayMs);
+          }
+        });
+      };
+
+      try {
+        const lastId = await AsyncStorage.getItem(STORAGE_KEYS.lastConnectedDeviceId);
+
+        if (lastId) {
+          try {
+            await connectToDevice(lastId, {
+              timeout: connectTimeout,
+              autoConnect,
+            });
+
+            if (enableAutoRescan) {
+              setupAutoRescan();
+            }
+            return;
+          } catch {
+            await AsyncStorage.removeItem(STORAGE_KEYS.lastConnectedDeviceId);
+          }
+        }
+
+        await performScanAndConnect();
+
+        if (enableAutoRescan) {
+          setupAutoRescan();
+        }
+      } catch (err: any) {
+        dispatch(
+          setError({
+            message: err.message || 'Connection failed',
+          }),
+        );
+        dispatch(setStatus(BluetoothStatus.Error));
+        throw err;
+      } finally {
+        await stopScan().catch(() => undefined);
+      }
+    },
+    [connectToDevice, dispatch, stopScan],
+  );
+
+  const sendServoAngle = useCallback<
+    UseBluetoothReturn['sendServoAngle']
+  >(
+    async ({xDeg, yDeg, durationMs, commandId}) => {
+      logHook('准备发送舵机角度命令', {
+        xDeg,
+        yDeg,
+        durationMs,
+        commandId,
+      });
+      const response = await sendProtocolRequest(
+        buildServoAngleCommand({
+          ...(typeof xDeg === 'number' ? {x_deg: clampAngle(xDeg)} : {}),
+          ...(typeof yDeg === 'number' ? {y_deg: clampAngle(yDeg)} : {}),
+          ...(typeof durationMs === 'number' ? {duration_ms: durationMs} : {}),
+          ...(commandId ? {command_id: commandId} : {}),
+        }),
+      );
+
+      return assertAckForCommand(response, BLE_PROTOCOL_TYPES.servoAngle);
+    },
+    [sendProtocolRequest],
+  );
+
+  const sendAiStatus = useCallback<
+    UseBluetoothReturn['sendAiStatus']
+  >(
+    async ({status: nextStatus, message, imageName, actionFile, soundFile, commandId}) => {
+      logHook('准备发送 AI 状态命令', {
+        status: nextStatus,
+        message,
+        imageName,
+        actionFile,
+        soundFile,
+        commandId,
+      });
+      const response = await sendProtocolRequest(
+        buildAiStatusCommand({
+          ...(nextStatus ? {status: nextStatus} : {}),
+          ...(message ? {message} : {}),
+          ...(imageName ? {image_name: imageName} : {}),
+          ...(actionFile ? {action_file: actionFile} : {}),
+          ...(soundFile ? {sound_file: soundFile} : {}),
+          ...(commandId ? {command_id: commandId} : {}),
+        }),
+      );
+
+      return assertAckForCommand(response, BLE_PROTOCOL_TYPES.aiStatus);
+    },
+    [sendProtocolRequest],
+  );
+
+  const setRobotState = useCallback<
+    UseBluetoothReturn['setRobotState']
+  >(
+    async ({stateId, commandId}) => {
+      logHook('准备设置机器人状态', {stateId, commandId});
+      const response = await sendProtocolRequest(
+        buildRobotStateSetCommand({
+          state_id: stateId,
+          ...(commandId ? {command_id: commandId} : {}),
+        }),
+      );
+
+      return assertAckForCommand(response, BLE_PROTOCOL_TYPES.robotStateSet);
+    },
+    [sendProtocolRequest],
+  );
+
+  const setWifiConfig = useCallback<
+    UseBluetoothReturn['setWifiConfig']
+  >(
+    async ({ssid, password, commandId}) => {
+      logHook('准备下发 Wi-Fi 配置', {
+        ssid,
+        hasPassword: Boolean(password),
+        commandId,
+      });
+      const response = await sendProtocolRequest(
+        buildWifiSetCommand({
+          ssid,
+          password,
+          ...(commandId ? {command_id: commandId} : {}),
+        }),
+      );
+
+      if (response.type === BLE_PROTOCOL_TYPES.wifiSet) {
+        logHook('Wi-Fi 配置写入收到请求回显，接受并继续等待异步状态', {
+          response: summarizeProtocolMessage(response),
+        });
+        return {
+          type: BLE_PROTOCOL_TYPES.ack,
+          code: 0,
+          data: {
+            type: BLE_PROTOCOL_TYPES.wifiSet,
+            ...(response.data.command_id
+              ? {command_id: response.data.command_id}
+              : {}),
+          },
+        };
+      }
+
+      return assertAckForCommand(response, BLE_PROTOCOL_TYPES.wifiSet);
+    },
+    [sendProtocolRequest],
+  );
+
+  const getWifiStatus = useCallback<
+    UseBluetoothReturn['getWifiStatus']
+  >(
+    async commandId => {
+      logHook('主动请求 Wi-Fi 状态', {commandId});
+      const baselineSequence = protocolSequenceRef.current + 1;
+      const response = await sendProtocolRequest(buildWifiGetCommand(commandId));
+      return await resolveWifiOperationStatus(
+        response,
+        BLE_PROTOCOL_TYPES.wifiGet,
+        undefined,
+        baselineSequence,
+      );
+    },
+    [resolveWifiOperationStatus, sendProtocolRequest],
+  );
+
+  const clearWifiConfig = useCallback<
+    UseBluetoothReturn['clearWifiConfig']
+  >(
+    async commandId => {
+      logHook('准备清除 Wi-Fi 配置', {commandId});
+      const baselineSequence = protocolSequenceRef.current + 1;
+      const response = await sendProtocolRequest(
+        buildWifiClearCommand(commandId),
+      );
+      return await resolveWifiOperationStatus(
+        response,
+        BLE_PROTOCOL_TYPES.wifiClear,
+        ['unconfigured'],
+        baselineSequence,
+      );
+    },
+    [resolveWifiOperationStatus, sendProtocolRequest],
+  );
+
+  const pingDevice = useCallback(async () => {
+    logHook('准备发送 Ping');
+    const response = await sendProtocolRequest(buildPingCommand());
+    return assertPongMessage(response);
+  }, [sendProtocolRequest]);
+
+  const clearError = useCallback(() => {
+    dispatch(setError(null));
+    if (status === BluetoothStatus.Error) {
+      dispatch(setStatus(BluetoothStatus.Idle));
+    }
+  }, [dispatch, status]);
+
+  const clearAll = useCallback(() => {
+    dispatch(setStatus(BluetoothStatus.Idle));
+    dispatch(setDeviceInfo(null));
+    dispatch(setReceivedData(null));
+    dispatch(setError(null));
+  }, [dispatch]);
+
+  return {
+    status,
+    deviceInfo,
+    receivedData,
+    error,
+    initialize,
+    startScan,
+    stopScan,
+    connectToDevice,
+    connectToConfiguredDevice,
+    disconnect,
+    writeData,
+    readData,
+    subscribeToNotifications,
+    subscribeToProtocolMessages,
+    sendServoAngle,
+    sendAiStatus,
+    setRobotState,
+    setWifiConfig,
+    getWifiStatus,
+    clearWifiConfig,
+    pingDevice,
+    clearError,
+    clearAll,
+  };
 };

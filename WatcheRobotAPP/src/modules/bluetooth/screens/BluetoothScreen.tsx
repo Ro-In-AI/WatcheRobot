@@ -1,15 +1,12 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import {
     View,
-    Text,
     StyleSheet,
     TouchableOpacity,
     TextInput,
     ScrollView,
     Alert,
-    Platform,
     SafeAreaView,
-    ActivityIndicator,
     StatusBar,
 } from 'react-native';
 import { AppText } from '../../app-text';
@@ -167,7 +164,7 @@ export const BluetoothScreen: React.FC = () => {
                 addLog(`正在订阅 ${targetCharUUID}...`);
                 const unsub = subscribeToNotifications(
                     { serviceUUID: targetServiceUUID, characteristicUUID: targetCharUUID },
-                    (data) => {
+                    () => {
                         // 数据处理已在 useEffect 中统一处理
                     }
                 );

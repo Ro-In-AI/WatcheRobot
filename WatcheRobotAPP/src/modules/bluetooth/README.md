@@ -12,6 +12,13 @@
 - 💾 **状态管理**：集成 Redux，统一管理连接状态和数据
 - 📱 **UI 组件**：提供开箱即用的扫描弹窗和状态展示组件
 
+## 🔌 BLE JSON 协议说明
+
+- 当前 App 已切换到单服务单特征模型：`00FF / FF01`
+- Android 连接默认申请 `MTU 247`
+- 业务消息统一使用 JSON object 编码，并通过 `write with response + 同特征 notify/read fallback` 交互
+- 推荐直接使用 `useBluetooth` 暴露的协议方法，而不是拼接裸字符串命令
+
 ## 🚀 快速开始 (Quick Start)
 
 ### 引入模块 (Import)
@@ -44,14 +51,18 @@ function MyComponent() {
     deviceInfo, 
     startScan, 
     connectToDevice,
-    disconnect 
+    disconnect,
+    sendServoAngle,
+    setWifiConfig,
   } = useBluetooth();
 
   // 扫描并连接
   const handleScan = async () => {
     await startScan((device) => {
       if (device.name === 'MyDevice') {
-        connectToDevice(device.id);
+        await connectToDevice(device.id);
+        await sendServoAngle({xDeg: 90, yDeg: 110});
+        await setWifiConfig({ssid: 'OfficeWiFi', password: '12345678'});
       }
     });
   };
@@ -193,22 +204,6 @@ Bluetooth 模块测试页面
 
 - boolean - 成功执行
 
-#### [`SendCommandOptions`](types/index.ts#L140)
-
-发送命令选项接口
-
-配置发送命令到蓝牙设备的参数，包括数据、服务 UUID、特征值 UUID 和命令类型。
-
-**属性 (Properties)**
-
-| 属性名 (Name) | 类型 (Type) | 必填 (Required) | 描述 (Description) | 默认值 (Default) | 备注 (Remarks) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| [`characteristicUUID`](types/index.ts#L143) | string | 否 |  | - | - |
-| [`data`](types/index.ts#L141) | string \| [`Uint8Array`](#uint8array) | 是 |  | - | - |
-| [`serviceUUID`](types/index.ts#L142) | string | 否 |  | - | - |
-| [`type`](types/index.ts#L144) | "response" \| "no_response" | 否 |  | - | - |
-
-
 #### [`UseBluetoothReturn`](types/index.ts#L185)
 
 useBluetooth Hook 的返回值类型定义
@@ -307,20 +302,18 @@ useBluetooth Hook 的返回值类型定义
 
 - Promise<string> - 读取到的数据 (Base64 字符串)
 
-##### [`sendCommand`](types/index.ts#L280)
+##### 协议业务方法
 
-发送命令到设备 (高级方法)
-封装了常用的发送逻辑
+以下方法通过同一个 `00FF / FF01` 特征收发 JSON：
 
-**请求参数 (Request Parameters)**
-
-| 参数名 (Name) | 类型 (Type) | 描述 (Description) |
-| :--- | :--- | :--- |
-| `options` | [`SendCommandOptions`](#sendcommandoptions) | 发送命令选项 |
-
-**返回值 (Returns)**
-
-- Promise<void> - 成功执行
+- `sendServoAngle({ xDeg?, yDeg?, commandId? })`
+- `sendAiStatus({ status, actionFile, message?, soundFile?, commandId? })`
+- `setRobotState({ state, commandId? })`
+- `setWifiConfig({ ssid, password, commandId? })`
+- `getWifiStatus({ commandId? })`
+- `clearWifiConfig({ commandId? })`
+- `pingDevice({ timestamp?, commandId? })`
+- `subscribeToProtocolMessages(listener)`
 
 ##### [`startScan`](types/index.ts#L209)
 

@@ -4,40 +4,16 @@
   "ble_device_name": "ESP_ROBOT",
   "services": [
     {
-      "name": "RobotService",
-      "uuid": "FF00",
-      "description": "机器人主服务",
+      "name": "RobotProtocolService",
+      "uuid": "00FF",
+      "description": "Watcher Robot BLE JSON protocol service",
       "characteristics": [
         {
-          "name": "SERVO_CTRL",
+          "name": "PROTOCOL_IO",
           "uuid": "FF01",
-          "type": [
-            "WRITE",
-            "READ",
-            "NOTIFY"
-          ],
+          "type": ["WRITE", "READ", "NOTIFY"],
           "value_format": "string",
-          "description": "舵机控制 - 写入命令如 SET_SERVO:0:90"
-        },
-        {
-          "name": "ACTION_CTRL",
-          "uuid": "FF02",
-          "type": [
-            "WRITE",
-            "READ"
-          ],
-          "value_format": "string",
-          "description": "动作控制 - 写入命令如 PLAY_ACTION:0"
-        },
-        {
-          "name": "STATUS",
-          "uuid": "FF03",
-          "type": [
-            "READ",
-            "NOTIFY"
-          ],
-          "value_format": "string",
-          "description": "状态推送 - 接收机器人状态反馈"
+          "description": "Single characteristic for JSON requests, ACK/NACK responses, and notify events"
         }
       ]
     },

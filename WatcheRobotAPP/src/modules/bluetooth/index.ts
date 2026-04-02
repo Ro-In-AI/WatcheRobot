@@ -17,6 +17,7 @@ export * from './screens/BluetoothScreen';
 export * from './services/bluetoothService';
 export * from './services/bleCommandHelper';
 export * from './hooks/useBluetooth';
+export * from './protocol/bleProtocol';
 /** @hidden */
 export * from './store';
 /** @hidden */
