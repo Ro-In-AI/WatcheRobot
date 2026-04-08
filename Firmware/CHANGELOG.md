@@ -11,6 +11,122 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [0.1.7] - 2026-04-08
+
+### Fixed
+- BLE-to-WebSocket recovery memory storms are reduced during reconnect and runtime handoff
+- Display text and font updates stay in sync more reliably with behavior state and WebSocket-driven UI changes
+- UI state transitions are more resilient when local state updates and cloud state updates overlap
+
+### Changed
+- Firmware version is now tracked as `v0.1.7`
+- Current release baseline now includes the merged BLE/WS recovery hardening and the latest UI state synchronization fixes from `main`
+
+### Notes
+- Release focus: BLE/WS recovery stability and UI state consistency
+- `v0.1.7` is the recommended package for validating reconnect stability, state handoff, and on-screen text behavior together
+
+---
+
+## [0.1.6] - 2026-04-03
+
+### Added
+- Dedicated Bluetooth feedback state with a matching animation pack and local Bluetooth SFX asset
+
+### Fixed
+- TTS playback recovery is more reliable after the audio path drops or switches away unexpectedly
+- BLE-disconnect recovery now tries the last successful WebSocket endpoint before falling back to UDP discovery
+- WebSocket reconnect recovery is less likely to stall on a fresh discovery cycle when the previous server endpoint is still valid
+- Speaking and thinking SPIFFS action timing is refined for smoother motion during expression playback
+
+### Changed
+- Firmware version is now tracked as `v0.1.6`
+- WebSocket client auto reconnect is disabled so the transport coordinator owns reconnect policy explicitly
+- The flashing helper now prefers `export.ps1` so build and flash steps use the same ESP-IDF Python environment on Windows
+- Current release packaging now reflects the latest animation, action, Bluetooth feedback, and audio recovery baseline on `main`
+
+### Notes
+- Release focus: Bluetooth feedback state integration, stronger TTS recovery, cached WebSocket resume, and cleaned-up speaking/thinking action curves
+- `v0.1.6` is the recommended package for validating Bluetooth state feedback, TTS recovery, startup transitions, and action playback together
+
+---
+
+## [0.1.5] - 2026-04-03
+
+### Fixed
+- Animation layering is more stable, with emoji overlays aligned correctly and the main animation recentered on the display
+- SPIFFS-driven behavior actions are more resilient when an action clip is missing or a fallback path is needed
+- Startup expression handoff is less likely to desync animation and action playback during bring-up
+
+### Changed
+- Firmware version is now tracked as `v0.1.5`
+- Current release packaging and documentation are aligned around the repaired animation system and action system baseline
+- This release also carries the latest servo interpolation and runtime stability fixes already merged on `main`
+
+### Notes
+- Release focus: animation system fixes, behavior action fallback hardening, and a clean test baseline for current mainline integration
+- `v0.1.5` is the recommended package for validating expression playback, action triggering, and startup state transitions together
+
+---
+
+## [0.1.3] - 2026-04-02
+
+### Added
+- Staged low-memory BLE-to-Wi-Fi recovery flow that can pause BLE advertising, reclaim optional cloud runtime memory, and retry Wi-Fi with a degraded largest-block threshold after repeated heap defers
+
+### Fixed
+- BLE and Wi-Fi recovery is more stable on low-internal-heap devices after BLE disconnects
+- Recording start is less likely to trigger LCD flush `ESP_ERR_NO_MEM` failures when internal heap headroom is too small
+- WebSocket runtime teardown now releases more resources cleanly before reconnect attempts
+
+### Changed
+- Firmware version is now tracked as `v0.1.3`
+- WebSocket client runtime now uses smaller default buffers, dynamic client buffering, and PSRAM-backed audio frame storage to preserve internal RAM for BLE, Wi-Fi, and LCD DMA
+- Listening animation assets were refreshed and the generated SPIFFS animation manifest was updated
+
+### Notes
+- Release focus: stable BLE provisioning and Wi-Fi validation on the current mainline
+- `v0.1.3` is the recommended baseline for repeated BLE pairing, Wi-Fi provisioning, disconnect/reconnect, and recovery-path testing
+
+---
+
+## [0.1.2alpha] - 2026-04-01
+
+### Added
+- BLE-priority transport coordinator for cloud recovery after BLE sessions release control
+
+### Fixed
+- BLE / Wi-Fi / WebSocket handoff is more stable after BLE disconnects
+- Cloud recovery path is less fragile during provisioning, reconnect, and local-control-first bring-up
+
+### Changed
+- Firmware version is now tracked as `0.1.2alpha`
+- Main transport flow now prioritizes BLE control sessions while coordinating Wi-Fi resume, discovery, and WebSocket recovery in the background
+- Current mainline also includes the earlier 3-click restart path and delayed input initialization improvements from `0.1.1`
+
+### Notes
+- Release focus: BLE-priority transport recovery and continued local bring-up validation
+
+---
+
+## [0.1.1] - 2026-04-01
+
+### Added
+- Earlier physical restart availability through delayed input initialization immediately after boot UI setup
+
+### Fixed
+- Button-based restart no longer depends on cloud readiness before becoming available
+- Boot-time input probing now emits clearer diagnostics around IO expander readiness and delayed input attachment
+
+### Changed
+- Physical restart trigger is reduced from 5 short presses to 3 short presses
+- Runtime input initialization and restart callback registration now run after boot UI setup regardless of cloud connection state
+
+### Notes
+- Release focus: make local recovery and BLE-side bring-up easier during ongoing integration and provisioning validation
+
+---
+
 ## [0.1.0-beta] - 2026-03-30
 
 ### Added

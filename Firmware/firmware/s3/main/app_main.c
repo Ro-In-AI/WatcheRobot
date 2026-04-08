@@ -1,19 +1,25 @@
-#include "sdkconfig.h"
 #include "esp_err.h"
+#include "esp_app_desc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_task_wdt.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
+#include "sdkconfig.h"
 
+#include "anim_player.h"
 #include "anim_storage.h"
 #include "behavior_state_service.h"
 #include "ble_service.h"
 #include "boot_anim.h"
 #include "bsp_watcher.h"
 #include "camera_service.h"
+#include "control_ingress.h"
 #include "discovery_client.h"
 #include "display_ui.h"
+#include "esp_lvgl_port.h"
 #include "hal_display.h"
 #include "hal_servo.h"
 #include "ota_service.h"
@@ -30,64 +36,332 @@
 #define TAG "MAIN"
 
 /* Physical restart: click count to trigger reboot */
-#define RESTART_CLICK_COUNT 5
+#define RESTART_CLICK_COUNT 3
 #define STARTUP_BEHAVIOR_POLL_MS 50
 #define STARTUP_BEHAVIOR_TIMEOUT_MS 10000
-#define BOOT_DISCOVERY_TIMEOUT_MS 5000
+#define CLOUD_DISCOVERY_TIMEOUT_MS 5000
+#define CLOUD_RETRY_DELAY_MS 2000
+#define CLOUD_PROTOCOL_RETRY_DELAY_MS 5000
+#define CACHED_WS_CONNECT_TIMEOUT_MS 5000U
+#define CACHED_WS_URL_MAX_LEN 128U
+#define WIFI_RESUME_MIN_INTERNAL_FREE_BYTES (28U * 1024U)
+#define WIFI_RESUME_MIN_INTERNAL_LARGEST_BYTES (16U * 1024U)
+#define WIFI_RESUME_RECOVERY_MIN_INTERNAL_LARGEST_BYTES (12U * 1024U)
+#define WIFI_RESUME_LOW_MEMORY_RECOVERY_DEFERS 3U
+#define WS_START_MIN_INTERNAL_FREE_BYTES (30U * 1024U)
+#define WS_START_MIN_INTERNAL_LARGEST_BYTES (15U * 1024U)
+#define WS_START_RECOVERY_MIN_INTERNAL_LARGEST_BYTES (14U * 1024U)
+#define WS_START_LOW_MEMORY_RECOVERY_DEFERS 3U
+#define WS_START_DISPLAY_SETTLE_MS 150U
+#define CLOUD_RUNTIME_MIN_INTERNAL_FREE_BYTES (24U * 1024U)
+#define CLOUD_RUNTIME_MIN_INTERNAL_LARGEST_BYTES (12U * 1024U)
+#define CAMERA_DIAG_MIN_INTERNAL_FREE_BYTES (48U * 1024U)
+#define CAMERA_DIAG_MIN_INTERNAL_LARGEST_BYTES (16U * 1024U)
 #ifdef CONFIG_WATCHER_ANIM_FPS
 #define BOOT_ANIM_INTERVAL_MS (1000U / CONFIG_WATCHER_ANIM_FPS)
 #else
 #define BOOT_ANIM_INTERVAL_MS 100U
 #endif
 
+typedef enum {
+    TRANSPORT_BLE_ACTIVE = 0,
+    TRANSPORT_BLE_IDLE_NO_CREDENTIALS,
+    TRANSPORT_BLE_IDLE_WIFI_STARTING,
+    TRANSPORT_BLE_IDLE_WIFI_CONNECTING,
+    TRANSPORT_BLE_IDLE_DISCOVERING,
+    TRANSPORT_BLE_IDLE_WS_CONNECTING,
+    TRANSPORT_BLE_IDLE_CLOUD_READY,
+    TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED,
+} transport_state_t;
+
+typedef enum {
+    IDLE_HINT_READY = 0,
+    IDLE_HINT_BLE_CONNECTED,
+    IDLE_HINT_WIFI_SETUP_REQUIRED,
+    IDLE_HINT_WIFI_RECOVERING,
+    IDLE_HINT_WIFI_FAILED,
+    IDLE_HINT_CLOUD_CONNECTING,
+} idle_hint_mode_t;
+
+typedef struct {
+    const char *text;
+    int font_size;
+    bool alert;
+} idle_hint_view_t;
+
+typedef struct {
+    uint32_t generation;
+    int status;
+    server_info_t info;
+} discovery_result_t;
+
 static bool s_waiting_for_wifi_provision = false;
-static bool s_ble_only_mode = false;
+static bool s_boot_completed = false;
+static bool s_ui_ready = false;
+static bool s_cloud_runtime_started = false;
+static bool s_ws_router_ready = false;
+static bool s_ws_stack_ready = false;
+static bool s_discovery_initialized = false;
+static bool s_last_ble_connected = false;
+static volatile bool s_ble_connected_feedback_pending = false;
+static bool s_wifi_failed_since_last_success = false;
+static bool s_low_memory_recovery_active = false;
+static bool s_ble_advertising_paused_for_recovery = false;
+static bool s_cached_ws_attempted_since_wifi_restore = false;
+static bool s_cached_ws_connect_inflight = false;
+static transport_state_t s_transport_state = TRANSPORT_BLE_IDLE_NO_CREDENTIALS;
+static volatile bool s_discovery_inflight = false;
+static uint32_t s_consecutive_wifi_resume_defers = 0;
+static uint32_t s_consecutive_ws_start_defers = 0;
+static uint32_t s_discovery_generation = 0;
+static int64_t s_next_cloud_attempt_us = 0;
+static int64_t s_cached_ws_connect_started_us = 0;
+static int64_t s_wifi_recovery_started_us = 0;
+static QueueHandle_t s_discovery_result_queue = NULL;
+static char s_cached_ws_url[CACHED_WS_URL_MAX_LEN] = {0};
+
+static const char *transport_state_to_string(transport_state_t state) {
+    switch (state) {
+    case TRANSPORT_BLE_ACTIVE:
+        return "BLE_ACTIVE";
+    case TRANSPORT_BLE_IDLE_NO_CREDENTIALS:
+        return "BLE_IDLE_NO_CREDENTIALS";
+    case TRANSPORT_BLE_IDLE_WIFI_STARTING:
+        return "BLE_IDLE_WIFI_STARTING";
+    case TRANSPORT_BLE_IDLE_WIFI_CONNECTING:
+        return "BLE_IDLE_WIFI_CONNECTING";
+    case TRANSPORT_BLE_IDLE_DISCOVERING:
+        return "BLE_IDLE_DISCOVERING";
+    case TRANSPORT_BLE_IDLE_WS_CONNECTING:
+        return "BLE_IDLE_WS_CONNECTING";
+    case TRANSPORT_BLE_IDLE_CLOUD_READY:
+        return "BLE_IDLE_CLOUD_READY";
+    case TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED:
+    default:
+        return "BLE_IDLE_CLOUD_SUSPENDED";
+    }
+}
+
+static void transport_set_state(transport_state_t state, const char *reason) {
+    if (state == s_transport_state) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Transport state: %s -> %s (%s)", transport_state_to_string(s_transport_state),
+             transport_state_to_string(state), reason ? reason : "no reason");
+    s_transport_state = state;
+}
+
+static void transport_schedule_retry(uint32_t delay_ms) {
+    s_next_cloud_attempt_us = esp_timer_get_time() + ((int64_t)delay_ms * 1000LL);
+}
+
+static bool transport_retry_due(void) {
+    return s_next_cloud_attempt_us == 0 || esp_timer_get_time() >= s_next_cloud_attempt_us;
+}
+
+static void log_firmware_version(void) {
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    if (app_desc == NULL) {
+        return;
+    }
+
+    ESP_LOGI(TAG, "Firmware version: project=%s version=%s idf=%s",
+             app_desc->project_name,
+             app_desc->version,
+             app_desc->idf_ver);
+}
+
+static void on_ble_connection_changed(bool connected);
+#if CONFIG_WATCHER_LOG_HEAP_DIAGNOSTICS
+static void log_heap_state(const char *stage);
+#endif
+static void transport_cancel_discovery(const char *reason);
+static void transport_stop_ws(const char *reason);
+static void transport_set_ble_recovery_advertising_paused(bool paused, const char *reason);
+static void transport_suspend_cloud_runtime_for_low_memory(const char *reason);
+static void transport_enter_low_memory_recovery(const char *reason);
+static void transport_reset_low_memory_recovery(const char *reason);
+static int transport_prepare_ws_client(const char *ws_url);
+static void transport_reset_cached_ws_resume_state(void);
+static void wait_for_behavior_idle(uint32_t timeout_ms);
+static void maybe_play_ble_connected_feedback(void);
+
+#if CONFIG_WATCHER_LOG_HEAP_DIAGNOSTICS
+#define LOG_HEAP_STATE(stage) log_heap_state(stage)
+#else
+#define LOG_HEAP_STATE(stage) ((void)0)
+#endif
+
+static bool transport_has_wifi_resume_headroom_with_log(bool log_failure) {
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t min_largest_internal = s_low_memory_recovery_active ? WIFI_RESUME_RECOVERY_MIN_INTERNAL_LARGEST_BYTES
+                                                               : WIFI_RESUME_MIN_INTERNAL_LARGEST_BYTES;
+
+    if (free_internal < WIFI_RESUME_MIN_INTERNAL_FREE_BYTES || largest_internal < min_largest_internal) {
+        if (log_failure) {
+            ESP_LOGW(TAG, "Deferring WiFi resume due to low internal heap: free=%u largest=%u (need >=%u / >=%u)%s",
+                     (unsigned)free_internal, (unsigned)largest_internal, (unsigned)WIFI_RESUME_MIN_INTERNAL_FREE_BYTES,
+                     (unsigned)min_largest_internal, s_low_memory_recovery_active ? " [low-memory recovery]" : "");
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static bool transport_has_wifi_resume_headroom(void) {
+    return transport_has_wifi_resume_headroom_with_log(true);
+}
+
+static bool transport_has_ws_start_headroom_with_log(bool log_failure) {
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t min_largest_internal = s_low_memory_recovery_active ? WS_START_RECOVERY_MIN_INTERNAL_LARGEST_BYTES
+                                                               : WS_START_MIN_INTERNAL_LARGEST_BYTES;
+
+    if (free_internal < WS_START_MIN_INTERNAL_FREE_BYTES || largest_internal < min_largest_internal) {
+        if (log_failure) {
+            ESP_LOGW(TAG, "Deferring WebSocket start due to low internal heap: free=%u largest=%u (need >=%u / >=%u)%s",
+                     (unsigned)free_internal, (unsigned)largest_internal, (unsigned)WS_START_MIN_INTERNAL_FREE_BYTES,
+                     (unsigned)min_largest_internal, s_low_memory_recovery_active ? " [low-memory recovery]" : "");
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static bool transport_has_ws_start_headroom(void) {
+    return transport_has_ws_start_headroom_with_log(true);
+}
+
+static bool transport_has_cloud_runtime_headroom(void) {
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (free_internal < CLOUD_RUNTIME_MIN_INTERNAL_FREE_BYTES ||
+        largest_internal < CLOUD_RUNTIME_MIN_INTERNAL_LARGEST_BYTES) {
+        ESP_LOGW(TAG, "Deferring cloud runtime due to low internal heap: free=%u largest=%u (need >=%u / >=%u)",
+                 (unsigned)free_internal, (unsigned)largest_internal, (unsigned)CLOUD_RUNTIME_MIN_INTERNAL_FREE_BYTES,
+                 (unsigned)CLOUD_RUNTIME_MIN_INTERNAL_LARGEST_BYTES);
+        return false;
+    }
+
+    return true;
+}
+
+static bool transport_is_valid_ws_url(const char *ws_url) {
+    return ws_url != NULL && (strncmp(ws_url, "ws://", 5) == 0 || strncmp(ws_url, "wss://", 6) == 0);
+}
+
+static void transport_cache_ws_url(const char *ws_url, const char *reason) {
+    if (!transport_is_valid_ws_url(ws_url)) {
+        return;
+    }
+
+    if (strncmp(s_cached_ws_url, ws_url, sizeof(s_cached_ws_url)) == 0) {
+        return;
+    }
+
+    strncpy(s_cached_ws_url, ws_url, sizeof(s_cached_ws_url) - 1U);
+    s_cached_ws_url[sizeof(s_cached_ws_url) - 1U] = '\0';
+    ESP_LOGI(TAG, "Cached last known WebSocket URL: %s (%s)", s_cached_ws_url, reason ? reason : "no reason");
+}
+
+static void transport_clear_cached_ws_url(const char *reason) {
+    if (s_cached_ws_url[0] == '\0') {
+        return;
+    }
+
+    ESP_LOGW(TAG, "Clearing cached WebSocket URL %s (%s)", s_cached_ws_url, reason ? reason : "no reason");
+    s_cached_ws_url[0] = '\0';
+}
+
+static void transport_quiet_display_motion(void) {
+    if (lvgl_port_lock(0)) {
+        emoji_anim_stop();
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "Paused emoji animation while bringing up cloud transport");
+    }
+}
+
+static void transport_prepare_display_for_ws_start(void) {
+    transport_quiet_display_motion();
+    wait_for_behavior_idle(WS_START_DISPLAY_SETTLE_MS);
+    vTaskDelay(pdMS_TO_TICKS(WS_START_DISPLAY_SETTLE_MS));
+}
+
+static void transport_reset_cached_ws_resume_state(void) {
+    s_cached_ws_attempted_since_wifi_restore = false;
+    s_cached_ws_connect_inflight = false;
+    s_cached_ws_connect_started_us = 0;
+}
+
+static void transport_sync_boot_state(void) {
+    s_last_ble_connected = ble_service_is_connected();
+    s_ble_connected_feedback_pending = s_last_ble_connected;
+
+    if (s_last_ble_connected) {
+        s_transport_state = TRANSPORT_BLE_ACTIVE;
+    } else if (wifi_has_credentials() == 1) {
+        s_transport_state = TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED;
+    } else {
+        s_transport_state = TRANSPORT_BLE_IDLE_NO_CREDENTIALS;
+    }
+}
+
+#if CONFIG_WATCHER_CAMERA_BOOT_DIAG
+static bool has_internal_heap_headroom(size_t min_free_bytes, size_t min_largest_block_bytes) {
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    return free_internal >= min_free_bytes && largest_internal >= min_largest_block_bytes;
+}
+#endif
 
 static void on_wifi_status_changed(wifi_status_t status, const char *ssid, const char *ip_addr) {
     switch (status) {
     case WIFI_STATUS_CONNECTED:
-        ESP_LOGI(TAG, "WiFi connected: ssid=%s ip=%s", ssid ? ssid : "<unknown>",
-                 ip_addr ? ip_addr : "<no-ip>");
-        if (s_waiting_for_wifi_provision) {
-            boot_anim_set_text("WiFi Connected");
-        } else if (s_ble_only_mode) {
-            behavior_state_set_with_text("happy", ip_addr ? ip_addr : "WiFi Connected", 0);
+        ESP_LOGI(TAG, "WiFi connected: ssid=%s ip=%s", ssid ? ssid : "<unknown>", ip_addr ? ip_addr : "<no-ip>");
+        s_wifi_failed_since_last_success = false;
+        if (!s_low_memory_recovery_active) {
+            transport_reset_low_memory_recovery("wifi connected");
+        }
+        if (!s_boot_completed && s_waiting_for_wifi_provision) {
+            boot_anim_set_text("Wi-Fi connected");
         }
         break;
 
     case WIFI_STATUS_CONNECTING:
         ESP_LOGI(TAG, "WiFi connecting: ssid=%s", ssid ? ssid : "<unknown>");
-        if (s_waiting_for_wifi_provision) {
-            boot_anim_set_text("Connecting WiFi...");
-        } else if (s_ble_only_mode) {
-            behavior_state_set_with_text("processing", ssid ? ssid : "Connecting WiFi...", 0);
+        if (!s_boot_completed && s_waiting_for_wifi_provision) {
+            boot_anim_set_text("Connecting Wi-Fi...");
         }
         break;
 
     case WIFI_STATUS_DISCONNECTED:
         ESP_LOGW(TAG, "WiFi connect failed or disconnected: ssid=%s", ssid ? ssid : "<unknown>");
-        if (s_waiting_for_wifi_provision) {
-            boot_anim_set_text("WiFi Failed, Retry");
-        } else if (s_ble_only_mode) {
-            behavior_state_set_with_text("error", "WiFi Failed, Retry", 0);
+        if (!ble_service_is_connected() && wifi_has_credentials() == 1) {
+            s_wifi_failed_since_last_success = true;
+        }
+        if (!s_boot_completed && s_waiting_for_wifi_provision) {
+            boot_anim_set_text("Wi-Fi failed");
         }
         break;
 
     case WIFI_STATUS_UNCONFIGURED:
     default:
         ESP_LOGI(TAG, "WiFi unconfigured");
-        if (s_waiting_for_wifi_provision) {
-            boot_anim_set_text("Open APP Set WiFi");
-        } else if (s_ble_only_mode) {
-            behavior_state_set_with_text("standby", "Open APP Set WiFi", 0);
+        s_wifi_failed_since_last_success = false;
+        transport_reset_low_memory_recovery("wifi unconfigured");
+        if (!s_boot_completed && s_waiting_for_wifi_provision) {
+            boot_anim_set_text("Reconnect BLE to set Wi-Fi");
         }
         break;
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* Button Callbacks (using SDK's bsp_set_btn_* interface)             */
-/* ------------------------------------------------------------------ */
 
 static void on_button_multi_click_restart(void) {
     ESP_LOGW(TAG, "Button %d-click - REBOOTING!", RESTART_CLICK_COUNT);
@@ -96,9 +370,41 @@ static void on_button_multi_click_restart(void) {
     esp_restart();
 }
 
+static void init_runtime_inputs_and_restart_path(void) {
+    int input_ret;
+    bool knob_ready;
+
+    input_ret = hal_display_input_init();
+    knob_ready = hal_display_has_knob_input();
+
+    ESP_LOGI(TAG, "Delayed input init result=%d knob_ready=%d", input_ret, knob_ready ? 1 : 0);
+
+    if (input_ret != 0) {
+        ESP_LOGW(TAG, "Delayed display input initialization failed; continuing with degraded input availability");
+    }
+
+    if (knob_ready) {
+        bsp_set_btn_multi_click_cb(RESTART_CLICK_COUNT, on_button_multi_click_restart);
+        ESP_LOGI(TAG, "Registered %d-click restart callback", RESTART_CLICK_COUNT);
+    } else {
+        ESP_LOGW(TAG, "Skipping %d-click restart callback because knob input is unavailable", RESTART_CLICK_COUNT);
+    }
+}
+
 static void run_camera_boot_diag(void) {
 #if CONFIG_WATCHER_CAMERA_BOOT_DIAG
     esp_err_t ret;
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    size_t largest_internal = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+
+    if (!has_internal_heap_headroom(CAMERA_DIAG_MIN_INTERNAL_FREE_BYTES, CAMERA_DIAG_MIN_INTERNAL_LARGEST_BYTES)) {
+        ESP_LOGW(TAG,
+                 "Skipping camera boot diagnostic due to low internal heap: free=%u largest=%u "
+                 "(need >=%u / >=%u)",
+                 (unsigned)free_internal, (unsigned)largest_internal, (unsigned)CAMERA_DIAG_MIN_INTERNAL_FREE_BYTES,
+                 (unsigned)CAMERA_DIAG_MIN_INTERNAL_LARGEST_BYTES);
+        return;
+    }
 
     ESP_LOGI(TAG, "Camera boot diagnostic: begin");
     ret = camera_service_init();
@@ -117,6 +423,7 @@ static void run_camera_boot_diag(void) {
 #endif
 }
 
+#if CONFIG_WATCHER_LOG_HEAP_DIAGNOSTICS
 static void log_heap_state(const char *stage) {
     size_t free_8bit = heap_caps_get_free_size(MALLOC_CAP_8BIT);
     size_t largest_8bit = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
@@ -125,36 +432,214 @@ static void log_heap_state(const char *stage) {
     size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
     size_t largest_spiram = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM);
 
-    ESP_LOGI(TAG,
-             "Heap @ %s: 8bit=%u KB (largest %u KB), internal=%u KB (largest %u KB), psram=%u KB (largest %u KB)",
-             stage,
-             (unsigned)(free_8bit / 1024U),
-             (unsigned)(largest_8bit / 1024U),
-             (unsigned)(free_internal / 1024U),
-             (unsigned)(largest_internal / 1024U),
-             (unsigned)(free_spiram / 1024U),
-             (unsigned)(largest_spiram / 1024U));
+    ESP_LOGI(TAG, "Heap @ %s: 8bit=%u KB (largest %u KB), internal=%u KB (largest %u KB), psram=%u KB (largest %u KB)",
+             stage, (unsigned)(free_8bit / 1024U), (unsigned)(largest_8bit / 1024U), (unsigned)(free_internal / 1024U),
+             (unsigned)(largest_internal / 1024U), (unsigned)(free_spiram / 1024U), (unsigned)(largest_spiram / 1024U));
+}
+#endif
+
+static void transport_set_ble_recovery_advertising_paused(bool paused, const char *reason) {
+    esp_err_t err;
+
+    if (ble_service_is_connected()) {
+        s_ble_advertising_paused_for_recovery = false;
+        return;
+    }
+
+    if (paused) {
+        if (s_ble_advertising_paused_for_recovery) {
+            return;
+        }
+
+        err = ble_service_stop_advertising();
+        if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+            s_ble_advertising_paused_for_recovery = true;
+            ESP_LOGI(TAG, "Paused BLE advertising for low-memory recovery (%s)", reason ? reason : "no reason");
+        } else if (err != ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "Failed to pause BLE advertising for low-memory recovery: %s", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    if (!s_ble_advertising_paused_for_recovery) {
+        return;
+    }
+
+    err = ble_service_start_advertising();
+    if (err == ESP_OK || err == ESP_ERR_INVALID_STATE) {
+        s_ble_advertising_paused_for_recovery = false;
+        ESP_LOGI(TAG, "Resumed BLE advertising after low-memory recovery (%s)", reason ? reason : "no reason");
+    } else if (err != ESP_ERR_NOT_SUPPORTED) {
+        ESP_LOGW(TAG, "Failed to resume BLE advertising after low-memory recovery: %s", esp_err_to_name(err));
+    }
 }
 
-static int ensure_boot_wifi_connection(void) {
-    char saved_ssid[33] = {0};
-    if (wifi_has_credentials() != 1) {
-        ESP_LOGI(TAG, "No stored WiFi credentials found");
-        return -1;
+static void transport_suspend_cloud_runtime_for_low_memory(const char *reason) {
+    ESP_LOGW(TAG, "Suspending cloud runtime for low-memory recovery (%s)", reason ? reason : "no reason");
+    LOG_HEAP_STATE("lowmem_recovery_before_reclaim");
+    transport_cancel_discovery("low memory recovery");
+
+    transport_stop_ws("low memory recovery");
+    LOG_HEAP_STATE("lowmem_recovery_after_ws_stop");
+
+    ws_client_deinit();
+    s_ws_stack_ready = false;
+    LOG_HEAP_STATE("lowmem_recovery_after_ws_deinit");
+
+    voice_recorder_stop();
+    s_cloud_runtime_started = false;
+    LOG_HEAP_STATE("lowmem_recovery_after_voice_stop");
+}
+
+static void transport_enter_low_memory_recovery(const char *reason) {
+    if (s_low_memory_recovery_active) {
+        return;
     }
 
-    if (wifi_get_saved_ssid(saved_ssid, sizeof(saved_ssid)) == 0) {
-        ESP_LOGI(TAG, "Connecting to stored WiFi SSID: %s", saved_ssid);
+    s_low_memory_recovery_active = true;
+    s_wifi_recovery_started_us = esp_timer_get_time();
+    ESP_LOGW(TAG, "Entering low-memory WiFi recovery after %u deferred resume attempts (%s)",
+             (unsigned)s_consecutive_wifi_resume_defers, reason ? reason : "no reason");
+
+    transport_set_ble_recovery_advertising_paused(true, reason);
+    transport_suspend_cloud_runtime_for_low_memory(reason);
+}
+
+static void transport_reset_low_memory_recovery(const char *reason) {
+    int64_t duration_ms = 0;
+    bool had_active_recovery = s_low_memory_recovery_active;
+
+    if (s_wifi_recovery_started_us > 0) {
+        duration_ms = (esp_timer_get_time() - s_wifi_recovery_started_us) / 1000LL;
+    }
+
+    s_consecutive_wifi_resume_defers = 0;
+    s_consecutive_ws_start_defers = 0;
+    s_low_memory_recovery_active = false;
+    s_wifi_recovery_started_us = 0;
+
+    if (ble_service_is_connected()) {
+        s_ble_advertising_paused_for_recovery = false;
     } else {
-        ESP_LOGI(TAG, "Connecting to stored WiFi credentials");
+        transport_set_ble_recovery_advertising_paused(false, reason);
     }
 
-    if (wifi_connect() == 0) {
-        return 0;
+    if (had_active_recovery) {
+        ESP_LOGI(TAG, "Exiting low-memory WiFi recovery after %lld ms (%s)", duration_ms,
+                 reason ? reason : "no reason");
+    }
+}
+
+static bool transport_start_ws_transport(const char *ws_url, const char *start_reason) {
+    if (transport_prepare_ws_client(ws_url) != 0) {
+        ESP_LOGW(TAG, "WebSocket prepare failed for URL: %s", ws_url);
+        transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+        transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "ws prepare failed");
+        return false;
     }
 
-    ESP_LOGW(TAG, "Stored WiFi connect timed out, waiting for BLE provisioning");
-    return -1;
+    if (!transport_has_ws_start_headroom()) {
+        bool recovery_was_active = s_low_memory_recovery_active;
+
+        s_consecutive_ws_start_defers += 1U;
+        if (!s_low_memory_recovery_active &&
+            s_consecutive_ws_start_defers >= WS_START_LOW_MEMORY_RECOVERY_DEFERS) {
+            transport_enter_low_memory_recovery("repeated ws start low internal heap");
+        }
+
+        if (s_low_memory_recovery_active != recovery_was_active) {
+            if (!transport_has_ws_start_headroom()) {
+                LOG_HEAP_STATE("ws_start_deferred");
+                transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+                transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, s_low_memory_recovery_active
+                                                                            ? "low-memory recovery waiting ws heap headroom"
+                                                                            : "waiting ws heap headroom");
+                return false;
+            }
+        } else {
+            LOG_HEAP_STATE("ws_start_deferred");
+            transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, s_low_memory_recovery_active
+                                                                        ? "low-memory recovery waiting ws heap headroom"
+                                                                        : "waiting ws heap headroom");
+            return false;
+        }
+    }
+
+    transport_prepare_display_for_ws_start();
+    LOG_HEAP_STATE("before_ws_start");
+    if (ws_client_start() != 0) {
+        transport_stop_ws("ws start failed");
+        transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+        transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "ws start failed");
+        return false;
+    }
+
+    s_consecutive_ws_start_defers = 0;
+    transport_reset_low_memory_recovery(start_reason);
+    transport_schedule_retry(0);
+    LOG_HEAP_STATE("after_ws_start");
+    transport_set_state(TRANSPORT_BLE_IDLE_WS_CONNECTING, start_reason);
+    return true;
+}
+
+static bool transport_try_cached_ws_resume(void) {
+    if (s_cached_ws_url[0] == '\0' || s_cached_ws_attempted_since_wifi_restore) {
+        return false;
+    }
+
+    ESP_LOGI(TAG, "Trying cached WebSocket URL before discovery: %s", s_cached_ws_url);
+    if (transport_prepare_ws_client(s_cached_ws_url) != 0) {
+        ESP_LOGW(TAG, "Cached WebSocket URL is no longer usable, falling back to discovery");
+        transport_clear_cached_ws_url("cached ws prepare failed");
+        return false;
+    }
+
+    if (!transport_has_ws_start_headroom()) {
+        bool recovery_was_active = s_low_memory_recovery_active;
+
+        s_consecutive_ws_start_defers += 1U;
+        if (!s_low_memory_recovery_active &&
+            s_consecutive_ws_start_defers >= WS_START_LOW_MEMORY_RECOVERY_DEFERS) {
+            transport_enter_low_memory_recovery("repeated ws start low internal heap");
+        }
+
+        if (s_low_memory_recovery_active != recovery_was_active) {
+            if (!transport_has_ws_start_headroom()) {
+                LOG_HEAP_STATE("cached_ws_start_deferred");
+                transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+                transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, s_low_memory_recovery_active
+                                                                            ? "low-memory recovery waiting cached ws heap headroom"
+                                                                            : "waiting cached ws heap headroom");
+                return true;
+            }
+        } else {
+            LOG_HEAP_STATE("cached_ws_start_deferred");
+            transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, s_low_memory_recovery_active
+                                                                        ? "low-memory recovery waiting cached ws heap headroom"
+                                                                        : "waiting cached ws heap headroom");
+            return true;
+        }
+    }
+
+    transport_prepare_display_for_ws_start();
+    LOG_HEAP_STATE("before_cached_ws_start");
+    if (ws_client_start() != 0) {
+        transport_stop_ws("cached ws start failed");
+        transport_clear_cached_ws_url("cached ws start failed");
+        return false;
+    }
+
+    s_consecutive_ws_start_defers = 0;
+    transport_reset_low_memory_recovery("cached ws start requested");
+    transport_schedule_retry(0);
+    LOG_HEAP_STATE("after_cached_ws_start");
+    transport_set_state(TRANSPORT_BLE_IDLE_WS_CONNECTING, "cached ws start requested");
+    s_cached_ws_attempted_since_wifi_restore = true;
+    s_cached_ws_connect_inflight = true;
+    s_cached_ws_connect_started_us = esp_timer_get_time();
+    return true;
 }
 
 static void wait_for_behavior_idle(uint32_t timeout_ms) {
@@ -170,13 +655,532 @@ static void wait_for_behavior_idle(uint32_t timeout_ms) {
     }
 }
 
-/* ------------------------------------------------------------------ */
-/* Main Application                                                   */
-/* ------------------------------------------------------------------ */
+static idle_hint_mode_t get_idle_hint_mode(void) {
+    if (ble_service_is_connected()) {
+        return IDLE_HINT_BLE_CONNECTED;
+    }
+
+    if (wifi_has_credentials() != 1) {
+        return IDLE_HINT_WIFI_SETUP_REQUIRED;
+    }
+
+    if (s_transport_state == TRANSPORT_BLE_IDLE_CLOUD_READY) {
+        return IDLE_HINT_READY;
+    }
+
+    if (wifi_is_connected() == 1) {
+        return IDLE_HINT_CLOUD_CONNECTING;
+    }
+
+    if (s_wifi_failed_since_last_success) {
+        return IDLE_HINT_WIFI_FAILED;
+    }
+
+    switch (s_transport_state) {
+    case TRANSPORT_BLE_IDLE_WIFI_STARTING:
+    case TRANSPORT_BLE_IDLE_WIFI_CONNECTING:
+    case TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED:
+        return IDLE_HINT_WIFI_RECOVERING;
+
+    case TRANSPORT_BLE_IDLE_DISCOVERING:
+    case TRANSPORT_BLE_IDLE_WS_CONNECTING:
+        return IDLE_HINT_CLOUD_CONNECTING;
+
+    case TRANSPORT_BLE_IDLE_NO_CREDENTIALS:
+        return IDLE_HINT_WIFI_SETUP_REQUIRED;
+
+    case TRANSPORT_BLE_ACTIVE:
+        return IDLE_HINT_BLE_CONNECTED;
+
+    case TRANSPORT_BLE_IDLE_CLOUD_READY:
+        return IDLE_HINT_READY;
+
+    default:
+        return IDLE_HINT_WIFI_RECOVERING;
+    }
+}
+
+static idle_hint_view_t get_idle_hint_view(idle_hint_mode_t mode) {
+    switch (mode) {
+    case IDLE_HINT_BLE_CONNECTED:
+        return (idle_hint_view_t){.text = "BLE connected", .font_size = 0, .alert = false};
+
+    case IDLE_HINT_WIFI_SETUP_REQUIRED:
+        return (idle_hint_view_t){.text = "Reconnect BLE to set Wi-Fi", .font_size = 20, .alert = true};
+
+    case IDLE_HINT_WIFI_RECOVERING:
+        return (idle_hint_view_t){.text = "Reconnecting Wi-Fi...", .font_size = 22, .alert = false};
+
+    case IDLE_HINT_WIFI_FAILED:
+        return (idle_hint_view_t){.text = "Wi-Fi failed. Reconnect BLE.", .font_size = 20, .alert = true};
+
+    case IDLE_HINT_CLOUD_CONNECTING:
+        return (idle_hint_view_t){.text = "Connecting cloud...", .font_size = 22, .alert = false};
+
+    case IDLE_HINT_READY:
+    default:
+        return (idle_hint_view_t){.text = "Ready!", .font_size = 0, .alert = false};
+    }
+}
+
+static void apply_idle_hint_if_needed(void) {
+    static idle_hint_mode_t s_last_applied_hint = IDLE_HINT_READY;
+    static bool s_hint_initialized = false;
+    idle_hint_mode_t desired_hint = get_idle_hint_mode();
+    idle_hint_view_t view = get_idle_hint_view(desired_hint);
+
+    if (behavior_state_is_busy() || behavior_state_is_action_active()) {
+        return;
+    }
+
+    if (s_hint_initialized && desired_hint == s_last_applied_hint) {
+        return;
+    }
+
+    (void)behavior_state_set_with_text_style("standby", view.text, view.font_size, view.alert);
+
+    s_last_applied_hint = desired_hint;
+    s_hint_initialized = true;
+}
+
+static bool should_defer_ble_connected_feedback_for_state(const char *state_id) {
+    if (state_id == NULL || state_id[0] == '\0') {
+        return false;
+    }
+
+    return strcmp(state_id, "listening") == 0 || strcmp(state_id, "thinking") == 0 ||
+           strcmp(state_id, "processing") == 0 || strcmp(state_id, "speaking") == 0;
+}
+
+static void maybe_play_ble_connected_feedback(void) {
+    const char *current_state = NULL;
+    esp_err_t ret;
+
+    if (!s_ui_ready || !s_ble_connected_feedback_pending) {
+        return;
+    }
+
+    if (!ble_service_is_connected()) {
+        s_ble_connected_feedback_pending = false;
+        return;
+    }
+
+    if (behavior_state_is_action_active()) {
+        return;
+    }
+
+    current_state = behavior_state_get_current();
+    if (current_state != NULL && strcmp(current_state, "bluetooth") == 0) {
+        s_ble_connected_feedback_pending = false;
+        return;
+    }
+
+    if (should_defer_ble_connected_feedback_for_state(current_state)) {
+        return;
+    }
+
+    ret = behavior_state_set_with_text_style("bluetooth", "BLE connected", 0, false);
+    if (ret == ESP_OK) {
+        s_ble_connected_feedback_pending = false;
+        ESP_LOGI(TAG, "Triggered BLE connected feedback state");
+    } else {
+        ESP_LOGW(TAG, "Failed to trigger BLE connected feedback state: %s", esp_err_to_name(ret));
+    }
+}
+
+static void ensure_cloud_runtime_started(void) {
+    if (!s_boot_completed || s_cloud_runtime_started) {
+        return;
+    }
+
+    if (!transport_has_cloud_runtime_headroom()) {
+        return;
+    }
+
+    voice_recorder_init();
+    if (voice_recorder_start() != 0) {
+        ESP_LOGE(TAG, "Failed to start voice recorder (non-fatal)");
+    }
+
+    s_cloud_runtime_started = true;
+}
+
+static void transport_stop_ws(const char *reason) {
+    if (ws_client_is_started() || ws_client_is_connected() || ws_client_is_session_ready()) {
+        ESP_LOGI(TAG, "Stopping WebSocket transport (%s)", reason ? reason : "no reason");
+        ws_client_stop();
+    }
+}
+
+static void transport_discovery_task(void *arg) {
+    discovery_result_t result = {0};
+    uint32_t *generation = (uint32_t *)arg;
+
+    result.generation = generation ? *generation : 0;
+    result.status = discovery_start_with_timeout(&result.info, CLOUD_DISCOVERY_TIMEOUT_MS);
+
+    if (s_discovery_result_queue != NULL) {
+        (void)xQueueOverwrite(s_discovery_result_queue, &result);
+    }
+
+    s_discovery_inflight = false;
+    free(generation);
+    vTaskDelete(NULL);
+}
+
+static int transport_launch_discovery(void) {
+    BaseType_t task_ret;
+    uint32_t *generation;
+
+    if (s_discovery_inflight) {
+        return 0;
+    }
+
+    if (s_discovery_result_queue == NULL) {
+        s_discovery_result_queue = xQueueCreate(1, sizeof(discovery_result_t));
+        if (s_discovery_result_queue == NULL) {
+            ESP_LOGE(TAG, "Failed to create discovery result queue");
+            return -1;
+        }
+    }
+
+    generation = (uint32_t *)malloc(sizeof(uint32_t));
+    if (generation == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate discovery generation");
+        return -1;
+    }
+
+    s_discovery_generation += 1U;
+    *generation = s_discovery_generation;
+    s_discovery_inflight = true;
+
+    task_ret = xTaskCreate(transport_discovery_task, "cloud_discovery", 4096, generation, 5, NULL);
+    if (task_ret != pdPASS) {
+        s_discovery_inflight = false;
+        free(generation);
+        ESP_LOGE(TAG, "Failed to create discovery task");
+        return -1;
+    }
+
+    ESP_LOGI(TAG, "Started discovery generation %lu", (unsigned long)*generation);
+    transport_set_state(TRANSPORT_BLE_IDLE_DISCOVERING, "discovery task launched");
+    return 0;
+}
+
+static void transport_cancel_discovery(const char *reason) {
+    if (!s_discovery_inflight) {
+        return;
+    }
+
+    s_discovery_generation += 1U;
+    ESP_LOGI(TAG, "Discovery invalidated (%s)", reason ? reason : "no reason");
+}
+
+static int transport_prepare_ws_client(const char *ws_url) {
+    if (ws_url == NULL || ws_url[0] == '\0') {
+        return -1;
+    }
+
+    if (!s_ws_router_ready) {
+        ws_router_t router;
+
+        ws_handlers_init();
+        router = ws_handlers_get_router();
+        ws_router_init(&router);
+        s_ws_router_ready = true;
+    }
+
+    if (!s_ws_stack_ready || strcmp(ws_client_get_server_url(), ws_url) != 0) {
+        if (s_ws_stack_ready) {
+            transport_stop_ws("ws url refresh");
+            ws_client_deinit();
+            s_ws_stack_ready = false;
+        }
+
+        if (ws_client_set_server_url(ws_url) != 0) {
+            ESP_LOGE(TAG, "Failed to set WebSocket URL: %s", ws_url);
+            return -1;
+        }
+
+        if (ws_client_init() != 0) {
+            ESP_LOGE(TAG, "Failed to initialize WebSocket client");
+            return -1;
+        }
+
+        s_ws_stack_ready = true;
+    }
+
+    return 0;
+}
+
+static void transport_begin_wifi_resume(const char *reason) {
+    if (wifi_has_credentials() != 1) {
+        s_waiting_for_wifi_provision = true;
+        transport_reset_low_memory_recovery("missing credentials");
+        transport_stop_ws("missing credentials");
+        transport_set_state(TRANSPORT_BLE_IDLE_NO_CREDENTIALS, reason);
+        return;
+    }
+
+    s_waiting_for_wifi_provision = false;
+
+    if (wifi_is_connected() == 1) {
+        transport_reset_low_memory_recovery("wifi already connected");
+        return;
+    }
+
+    if (wifi_is_connect_requested() == 1) {
+        transport_set_state(
+            wifi_sta_is_started() == 1 ? TRANSPORT_BLE_IDLE_WIFI_CONNECTING : TRANSPORT_BLE_IDLE_WIFI_STARTING, reason);
+        return;
+    }
+
+    if (!transport_has_wifi_resume_headroom()) {
+        bool recovery_was_active = s_low_memory_recovery_active;
+
+        s_consecutive_wifi_resume_defers += 1U;
+        if (!s_low_memory_recovery_active &&
+            s_consecutive_wifi_resume_defers >= WIFI_RESUME_LOW_MEMORY_RECOVERY_DEFERS) {
+            transport_enter_low_memory_recovery("repeated low internal heap");
+        }
+
+        if (s_low_memory_recovery_active != recovery_was_active) {
+            if (!transport_has_wifi_resume_headroom()) {
+                transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+                transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, s_low_memory_recovery_active
+                                                                            ? "low-memory recovery waiting heap headroom"
+                                                                            : "waiting heap headroom");
+                return;
+            }
+        } else {
+            transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, s_low_memory_recovery_active
+                                                                        ? "low-memory recovery waiting heap headroom"
+                                                                        : "waiting heap headroom");
+            return;
+        }
+    }
+
+    s_consecutive_wifi_resume_defers = 0;
+
+    if (wifi_resume_background() == 0) {
+        transport_set_state(
+            wifi_sta_is_started() == 1 ? TRANSPORT_BLE_IDLE_WIFI_CONNECTING : TRANSPORT_BLE_IDLE_WIFI_STARTING, reason);
+        return;
+    }
+
+    transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+    transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "wifi resume failed");
+}
+
+static void transport_handle_discovery_results(bool ble_connected) {
+    discovery_result_t result;
+
+    if (s_discovery_result_queue == NULL) {
+        return;
+    }
+
+    while (xQueueReceive(s_discovery_result_queue, &result, 0) == pdTRUE) {
+        char *ws_url = NULL;
+
+        if (result.generation != s_discovery_generation) {
+            ESP_LOGI(TAG, "Ignoring stale discovery result generation %lu (current %lu)",
+                     (unsigned long)result.generation, (unsigned long)s_discovery_generation);
+            continue;
+        }
+
+        if (ble_connected) {
+            ESP_LOGI(TAG, "Ignoring discovery result because BLE is active");
+            continue;
+        }
+
+        if (result.status != 0) {
+            ESP_LOGW(TAG, "Discovery failed, retrying after %u ms", CLOUD_RETRY_DELAY_MS);
+            transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "discovery failed");
+            continue;
+        }
+
+        if (result.info.protocol_version[0] == '\0' ||
+            strcmp(result.info.protocol_version, WATCHER_PROTOCOL_VERSION) != 0) {
+            ESP_LOGE(TAG, "Protocol mismatch: server=%s expected=%s",
+                     result.info.protocol_version[0] != '\0' ? result.info.protocol_version : "<missing>",
+                     WATCHER_PROTOCOL_VERSION);
+            transport_schedule_retry(CLOUD_PROTOCOL_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "protocol mismatch");
+            continue;
+        }
+
+        ESP_LOGI(TAG, "Discovery ready: %s:%u protocol=%s", result.info.ip, result.info.port,
+                 result.info.protocol_version);
+
+        ws_url = discovery_get_ws_url(&result.info);
+        if (ws_url == NULL) {
+            ESP_LOGE(TAG, "Failed to build WebSocket URL from discovery result");
+            transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "ws url build failed");
+            continue;
+        }
+
+        if (!transport_start_ws_transport(ws_url, "ws start requested")) {
+            free(ws_url);
+            continue;
+        }
+
+        transport_cache_ws_url(ws_url, "discovery ready");
+        s_cached_ws_attempted_since_wifi_restore = true;
+        s_cached_ws_connect_inflight = false;
+        s_cached_ws_connect_started_us = 0;
+        free(ws_url);
+    }
+}
+
+static void transport_suspend_for_ble(void) {
+    ESP_LOGI(TAG, "BLE connected, pausing WiFi/WS background activity");
+    s_wifi_failed_since_last_success = false;
+    transport_reset_cached_ws_resume_state();
+    transport_reset_low_memory_recovery("ble connected");
+    transport_cancel_discovery("ble connected");
+    transport_stop_ws("ble connected");
+    wifi_suspend_for_ble();
+    transport_schedule_retry(0);
+    transport_set_state(TRANSPORT_BLE_ACTIVE, "ble connected");
+}
+
+static void on_ble_connection_changed(bool connected) {
+    s_last_ble_connected = connected;
+    s_ble_connected_feedback_pending = connected;
+
+    if (connected) {
+        transport_suspend_for_ble();
+        return;
+    }
+
+    ESP_LOGI(TAG, "BLE disconnected, allowing WiFi/WS recovery");
+    transport_reset_cached_ws_resume_state();
+    transport_schedule_retry(0);
+    transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "ble disconnected");
+}
+
+static void transport_coordinator_tick(void) {
+    bool ble_connected = ble_service_is_connected();
+
+    transport_handle_discovery_results(ble_connected);
+
+    if (ble_connected != s_last_ble_connected) {
+        s_last_ble_connected = ble_connected;
+
+        if (ble_connected) {
+            transport_suspend_for_ble();
+            return;
+        }
+
+        ESP_LOGI(TAG, "BLE disconnected, allowing WiFi/WS recovery");
+        transport_reset_cached_ws_resume_state();
+        transport_schedule_retry(0);
+        transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "ble disconnected");
+    }
+
+    if (ble_connected) {
+        transport_set_state(TRANSPORT_BLE_ACTIVE, "ble still connected");
+        return;
+    }
+
+    if (wifi_has_credentials() != 1) {
+        s_waiting_for_wifi_provision = true;
+        transport_reset_cached_ws_resume_state();
+        transport_clear_cached_ws_url("credentials cleared");
+        transport_reset_low_memory_recovery("credentials cleared");
+        transport_stop_ws("credentials cleared");
+        transport_set_state(TRANSPORT_BLE_IDLE_NO_CREDENTIALS, "no credentials");
+        return;
+    }
+
+    if (wifi_is_connected() != 1) {
+        transport_reset_cached_ws_resume_state();
+        transport_stop_ws("wifi not connected");
+
+        if (transport_retry_due()) {
+            transport_begin_wifi_resume("wifi recovery");
+        } else {
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "waiting wifi retry");
+        }
+        return;
+    }
+
+    s_waiting_for_wifi_provision = false;
+    if (!s_low_memory_recovery_active) {
+        transport_reset_low_memory_recovery("wifi restored");
+    }
+
+    if (!s_discovery_initialized) {
+        if (discovery_init() == 0) {
+            s_discovery_initialized = true;
+        } else {
+            ESP_LOGW(TAG, "Discovery init failed, retrying later");
+            transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+            transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "discovery init failed");
+            return;
+        }
+    }
+
+    if (ws_client_is_session_ready()) {
+        transport_cache_ws_url(ws_client_get_server_url(), "ws session ready");
+        s_cached_ws_connect_inflight = false;
+        s_cached_ws_connect_started_us = 0;
+        ensure_cloud_runtime_started();
+        transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_READY, "ws session ready");
+        return;
+    }
+
+    if (s_cached_ws_connect_inflight) {
+        int64_t elapsed_ms = (esp_timer_get_time() - s_cached_ws_connect_started_us) / 1000LL;
+
+        if (!(ws_client_is_connected() || ws_client_is_started())) {
+            s_cached_ws_connect_inflight = false;
+            s_cached_ws_connect_started_us = 0;
+            ESP_LOGW(TAG, "Cached WebSocket resume failed, falling back to discovery");
+            transport_schedule_retry(0);
+        } else if (elapsed_ms >= (int64_t)CACHED_WS_CONNECT_TIMEOUT_MS) {
+            ESP_LOGW(TAG, "Cached WebSocket resume timed out after %lld ms, falling back to discovery", elapsed_ms);
+            transport_stop_ws("cached ws connect timeout");
+            s_cached_ws_connect_inflight = false;
+            s_cached_ws_connect_started_us = 0;
+            transport_schedule_retry(0);
+        } else {
+            transport_set_state(TRANSPORT_BLE_IDLE_WS_CONNECTING, "cached ws connecting");
+            return;
+        }
+    }
+
+    if (ws_client_is_connected() || ws_client_is_started()) {
+        transport_set_state(TRANSPORT_BLE_IDLE_WS_CONNECTING, "ws connecting");
+        return;
+    }
+
+    if (s_discovery_inflight) {
+        transport_set_state(TRANSPORT_BLE_IDLE_DISCOVERING, "discovery in flight");
+        return;
+    }
+
+    if (!transport_retry_due()) {
+        transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "waiting cloud retry");
+        return;
+    }
+
+    if (transport_try_cached_ws_resume()) {
+        return;
+    }
+
+    if (transport_launch_discovery() != 0) {
+        transport_schedule_retry(CLOUD_RETRY_DELAY_MS);
+        transport_set_state(TRANSPORT_BLE_IDLE_CLOUD_SUSPENDED, "discovery launch failed");
+    }
+}
 
 void app_main(void) {
     ESP_LOGI(TAG, "WatcheRobot S3 v2.0 starting");
-    bool cloud_ready = false;
+    log_firmware_version();
 
     /* 1. Minimal display init for boot animation */
     if (hal_display_minimal_init() != 0) {
@@ -211,117 +1215,67 @@ void app_main(void) {
     boot_anim_set_text("State...");
     behavior_state_init();
 
+    if (control_ingress_init() != ESP_OK) {
+        ESP_LOGE(TAG, "Control ingress init failed");
+        return;
+    }
+
     /* 5.5 BLE control + provisioning */
     boot_anim_set_progress(35);
     boot_anim_set_text("BLE...");
-    esp_err_t ble_ret = ble_service_init();
-    if (ble_ret == ESP_OK) {
-        ble_ret = ble_service_start_advertising();
-        if (ble_ret != ESP_OK) {
-            ESP_LOGW(TAG, "BLE advertising start failed: %s", esp_err_to_name(ble_ret));
+    {
+        esp_err_t ble_ret = ble_service_init();
+        if (ble_ret == ESP_OK) {
+            ble_service_register_connection_callback(on_ble_connection_changed);
+            ble_ret = ble_service_start_advertising();
+            if (ble_ret != ESP_OK) {
+                ESP_LOGW(TAG, "BLE advertising start failed: %s", esp_err_to_name(ble_ret));
+            }
+        } else if (ble_ret != ESP_ERR_NOT_SUPPORTED) {
+            ESP_LOGW(TAG, "BLE init failed: %s", esp_err_to_name(ble_ret));
         }
-    } else if (ble_ret != ESP_ERR_NOT_SUPPORTED) {
-        ESP_LOGW(TAG, "BLE init failed: %s", esp_err_to_name(ble_ret));
     }
+    LOG_HEAP_STATE("after_ble_init");
 
-    /* 6. WiFi */
+    /* 6. WiFi manager only; cloud link is coordinated after boot. */
     boot_anim_set_progress(40);
     boot_anim_set_text("WiFi...");
     wifi_init();
     wifi_register_status_callback(on_wifi_status_changed);
-    if (ensure_boot_wifi_connection() != 0) {
-        s_waiting_for_wifi_provision = true;
-        boot_anim_set_text("Open APP Set WiFi");
-        ESP_LOGI(TAG, "Waiting for WiFi credentials via BLE provisioning");
-        if (wifi_wait_for_connection(-1) != 0) {
-            ESP_LOGE(TAG, "Waiting for WiFi connection failed");
-            return;
-        }
+    if (wifi_has_credentials() == 1) {
         s_waiting_for_wifi_provision = false;
+        boot_anim_set_text("Preparing...");
+        ESP_LOGI(TAG, "Stored WiFi credentials detected; deferring WiFi resume until startup settles");
+    } else {
+        s_waiting_for_wifi_provision = true;
+        boot_anim_set_text("Reconnect BLE to set Wi-Fi");
+        ESP_LOGI(TAG, "BLE local control is ready without immediate cloud bring-up");
     }
-    s_waiting_for_wifi_provision = false;
     boot_anim_set_progress(55);
+    LOG_HEAP_STATE("after_wifi_ready");
 
-    /* 7. Service discovery */
-    boot_anim_set_text("Discovering...");
-    discovery_init();
-    server_info_t server_info = {0};
-    if (discovery_start_with_timeout(&server_info, BOOT_DISCOVERY_TIMEOUT_MS) == 0) {
-        if (server_info.protocol_version[0] == '\0' ||
-            strcmp(server_info.protocol_version, WATCHER_PROTOCOL_VERSION) != 0) {
-            ESP_LOGE(TAG, "Protocol mismatch: server=%s expected=%s",
-                     server_info.protocol_version[0] != '\0' ? server_info.protocol_version : "<missing>",
-                     WATCHER_PROTOCOL_VERSION);
-            boot_anim_show_error("Protocol Mismatch");
-            return;
-        }
-
-        ESP_LOGI(TAG, "Server: %s:%u protocol=%s", server_info.ip, server_info.port, server_info.protocol_version);
-        boot_anim_set_progress(65);
-        char *ws_url = discovery_get_ws_url(&server_info);
-        if (ws_url) {
-            ws_client_set_server_url(ws_url);
-            free(ws_url);
-            cloud_ready = true;
-        }
-    } else {
-        ESP_LOGW(TAG, "Discovery failed within %d ms, continuing in BLE-only mode", BOOT_DISCOVERY_TIMEOUT_MS);
-    }
-
-    if (cloud_ready) {
-        /* 8. WebSocket client */
-        boot_anim_set_progress(92);
-        boot_anim_set_text("Connecting...");
-        ws_client_init();
-        ws_handlers_init();
-        ws_router_t router = ws_handlers_get_router();
-        ws_router_init(&router);
-    } else {
-        boot_anim_set_progress(100);
-        boot_anim_set_text("BLE Ready");
-        s_ble_only_mode = true;
-    }
-
-    /* 9. Ready! */
-    if (cloud_ready) {
-        boot_anim_set_progress(100);
-        boot_anim_set_text("Ready!");
-    }
+    /* 7. Ready for UI; cloud transport is resumed by the coordinator loop. */
+    boot_anim_set_progress(100);
+    boot_anim_set_text("BLE Ready");
     vTaskDelay(pdMS_TO_TICKS(500));
     boot_anim_finish();
-    log_heap_state("before_ui_init");
+
+    LOG_HEAP_STATE("before_ui_init");
     hal_display_ui_init();
-    if (cloud_ready) {
-        if (hal_display_input_init() != 0) {
-            ESP_LOGW(TAG, "Delayed display input initialization failed");
-        }
-
-        /* Register encoder callbacks only after delayed input devices are attached. */
-        if (hal_display_has_knob_input()) {
-            bsp_set_btn_multi_click_cb(RESTART_CLICK_COUNT, on_button_multi_click_restart);
-        } else {
-            ESP_LOGW(TAG, "Skipping %d-click restart callback because knob input is unavailable", RESTART_CLICK_COUNT);
-        }
-
-        voice_recorder_init();
-        if (voice_recorder_start() != 0) {
-            ESP_LOGE(TAG, "Failed to start voice recorder (non-fatal)");
-        }
-    }
-
+    s_ui_ready = true;
+    init_runtime_inputs_and_restart_path();
     behavior_state_set("boot");
     wait_for_behavior_idle(STARTUP_BEHAVIOR_TIMEOUT_MS);
-    behavior_state_set_text(cloud_ready ? "Ready!" : "BLE Ready", 0);
-    log_heap_state("after_ui_init");
-    if (cloud_ready) {
-        ws_client_start();
-        log_heap_state("after_ws_start");
-    }
+    behavior_state_set_text_style("BLE Ready", 0, false);
+    maybe_play_ble_connected_feedback();
+    apply_idle_hint_if_needed();
+    LOG_HEAP_STATE("after_ui_init");
+
     run_camera_boot_diag();
-    log_heap_state("after_camera_diag");
-    /* Note: hal_display_ui_init() already sets "Ready" text and starts default animation.
-     * Don't call display_update here as it would override the startup UI state. */
-    ESP_LOGI(TAG, "WatcheRobot ready (cloud=%s, ble=%s)", cloud_ready ? "online" : "offline",
+    LOG_HEAP_STATE("after_camera_diag");
+    s_boot_completed = true;
+    transport_sync_boot_state();
+    ESP_LOGI(TAG, "WatcheRobot ready (transport=%s, ble=%s)", transport_state_to_string(s_transport_state),
              ble_service_is_connected() ? "connected" : "advertising");
 
     /* 10. Mark OTA partition valid (prevent rollback after successful boot) */
@@ -331,6 +1285,9 @@ void app_main(void) {
     esp_task_wdt_add(NULL);
     while (1) {
         esp_task_wdt_reset();
+        transport_coordinator_tick();
+        maybe_play_ble_connected_feedback();
+        apply_idle_hint_if_needed();
         ws_tts_timeout_check();
         vTaskDelay(pdMS_TO_TICKS(100));
     }

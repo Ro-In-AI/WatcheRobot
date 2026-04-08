@@ -25,6 +25,22 @@
 extern const lv_font_t lv_font_simsun_16_cjk;
 #endif
 
+#if LV_FONT_MONTSERRAT_14
+extern const lv_font_t lv_font_montserrat_14;
+#endif
+
+#if LV_FONT_MONTSERRAT_20
+extern const lv_font_t lv_font_montserrat_20;
+#endif
+
+#if LV_FONT_MONTSERRAT_22
+extern const lv_font_t lv_font_montserrat_22;
+#endif
+
+#if LV_FONT_MONTSERRAT_24
+extern const lv_font_t lv_font_montserrat_24;
+#endif
+
 #include "esp_lvgl_port.h"
 
 #define TAG "HAL_DISPLAY"
@@ -46,6 +62,64 @@ static esp_lcd_panel_io_handle_t s_panel_io_handle = NULL;
 static esp_lcd_panel_handle_t s_panel_handle = NULL;
 static esp_lcd_panel_io_handle_t s_touch_io_handle = NULL;
 static esp_lcd_touch_handle_t s_touch_handle = NULL;
+
+static bool hal_display_text_has_non_ascii(const char *text) {
+    const unsigned char *cursor = (const unsigned char *)text;
+
+    if (text == NULL) {
+        return false;
+    }
+
+    while (*cursor != '\0') {
+        if (*cursor > 0x7F) {
+            return true;
+        }
+        cursor++;
+    }
+
+    return false;
+}
+
+static const lv_font_t *hal_display_select_text_font(const char *text, int font_size) {
+    bool use_cjk_font = hal_display_text_has_non_ascii(text);
+
+#if LV_FONT_SIMSUN_16_CJK
+    if (use_cjk_font) {
+        return &lv_font_simsun_16_cjk;
+    }
+#else
+    (void)use_cjk_font;
+#endif
+
+    if (font_size == 22) {
+#if LV_FONT_MONTSERRAT_22
+        return &lv_font_montserrat_22;
+#endif
+    } else if (font_size == 20) {
+#if LV_FONT_MONTSERRAT_20
+        return &lv_font_montserrat_20;
+#endif
+    } else if (font_size == 0 || font_size >= 24) {
+#if LV_FONT_MONTSERRAT_24
+        return &lv_font_montserrat_24;
+#endif
+    }
+
+#if LV_FONT_MONTSERRAT_14
+    return &lv_font_montserrat_14;
+#elif LV_FONT_SIMSUN_16_CJK
+    return &lv_font_simsun_16_cjk;
+#else
+    return LV_FONT_DEFAULT;
+#endif
+}
+
+static void hal_display_apply_text_style_locked(const char *text, int font_size, lv_color_t text_color) {
+    const lv_font_t *font = hal_display_select_text_font(text, font_size);
+
+    lv_obj_set_style_text_font(label_text, font, 0);
+    lv_obj_set_style_text_color(label_text, text_color, 0);
+}
 
 static void hal_display_general_i2c_delay(void) {
     esp_rom_delay_us(GENERAL_I2C_BITBANG_DELAY_US);
@@ -252,10 +326,12 @@ static const char *hal_display_emoji_name(int emoji_id) {
     case 6:
         return "error";
     case 7:
-        return "custom1";
+        return "bluetooth";
     case 8:
-        return "custom2";
+        return "custom1";
     case 9:
+        return "custom2";
+    case 10:
         return "custom3";
     default:
         return "unknown";
@@ -278,6 +354,8 @@ static int hal_display_anim_type_to_emoji_id(emoji_anim_type_t type) {
         return EMOJI_SPEAKING;
     case EMOJI_ANIM_ERROR:
         return EMOJI_ERROR;
+    case EMOJI_ANIM_BLUETOOTH:
+        return EMOJI_BLUETOOTH;
     case EMOJI_ANIM_CUSTOM_1:
         return EMOJI_CUSTOM_1;
     case EMOJI_ANIM_CUSTOM_2:
@@ -306,14 +384,22 @@ static emoji_anim_type_t map_emoji_type(int ui_emoji_id) {
         return EMOJI_ANIM_SPEAKING;  /* speaking */
     case 6:                          /* EMOJI_ERROR */
         return EMOJI_ANIM_ERROR;     /* error */
-    case 7:                          /* EMOJI_CUSTOM_1 */
-        return EMOJI_ANIM_CUSTOM_1;  /* custom1 */
-    case 8:                          /* EMOJI_CUSTOM_2 */
-        return EMOJI_ANIM_CUSTOM_2;  /* custom2 */
-    case 9:                          /* EMOJI_CUSTOM_3 */
-        return EMOJI_ANIM_CUSTOM_3;  /* custom3 */
+    case 7:                           /* EMOJI_BLUETOOTH */
+        return EMOJI_ANIM_BLUETOOTH;  /* bluetooth */
+    case 8:                           /* EMOJI_CUSTOM_1 */
+        return EMOJI_ANIM_CUSTOM_1;   /* custom1 */
+    case 9:                           /* EMOJI_CUSTOM_2 */
+        return EMOJI_ANIM_CUSTOM_2;   /* custom2 */
+    case 10:                          /* EMOJI_CUSTOM_3 */
+        return EMOJI_ANIM_CUSTOM_3;   /* custom3 */
     default:
         return EMOJI_ANIM_STANDBY;
+    }
+}
+
+static void hal_display_raise_text_overlay_locked(void) {
+    if (label_text != NULL) {
+        lv_obj_move_foreground(label_text);
     }
 }
 
@@ -677,7 +763,7 @@ int hal_display_init(void) {
 
     /* 6. Create emoji image FIRST (centered) - so it's in background */
     img_emoji = lv_img_create(scr);
-    lv_obj_align(img_emoji, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_align(img_emoji, LV_ALIGN_CENTER, 0, 0);
 
     /* 7. Create text label AFTER emoji - so it's in foreground */
     label_text = lv_label_create(scr);
@@ -687,20 +773,14 @@ int hal_display_init(void) {
     lv_label_set_text(label_text, "Ready");
     lv_obj_set_style_text_color(label_text, lv_color_white(), 0);
     lv_obj_align(label_text, LV_ALIGN_CENTER, 0, -140); /* Move higher to avoid emoji overlap */
-
-    /* Set CJK font for Chinese character support */
-#if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(label_text, &lv_font_simsun_16_cjk, 0);
-    ESP_LOGI(TAG, "Using SimSun 16 CJK font for Chinese support");
-#else
-    ESP_LOGW(TAG, "CJK font not enabled, Chinese characters may not display");
-#endif
+    lv_obj_set_style_text_font(label_text, hal_display_select_text_font("Ready", 24), 0);
 
     /* 9. Initialize animation system */
     if (emoji_anim_init(img_emoji) == 0) {
         /* Start with happy animation */
         lvgl_port_lock(0);
         emoji_anim_start(EMOJI_ANIM_HAPPY);
+        hal_display_raise_text_overlay_locked();
         lvgl_port_unlock();
     }
 
@@ -741,7 +821,7 @@ int hal_display_ui_init(void) {
 
     /* 4. Create emoji image FIRST (centered) - so it's in background */
     img_emoji = lv_img_create(scr);
-    lv_obj_align(img_emoji, LV_ALIGN_CENTER, 0, 40);
+    lv_obj_align(img_emoji, LV_ALIGN_CENTER, 0, 0);
 
     /* 5. Create text label AFTER emoji - so it's in foreground */
     label_text = lv_label_create(scr);
@@ -751,14 +831,7 @@ int hal_display_ui_init(void) {
     lv_label_set_text(label_text, "Ready");
     lv_obj_set_style_text_color(label_text, lv_color_white(), 0);
     lv_obj_align(label_text, LV_ALIGN_CENTER, 0, -140);
-
-    /* Set CJK font for Chinese character support */
-#if LV_FONT_SIMSUN_16_CJK
-    lv_obj_set_style_text_font(label_text, &lv_font_simsun_16_cjk, 0);
-    ESP_LOGI(TAG, "Using SimSun 16 CJK font for Chinese support");
-#else
-    ESP_LOGW(TAG, "CJK font not enabled, Chinese characters may not display");
-#endif
+    lv_obj_set_style_text_font(label_text, hal_display_select_text_font("Ready", 24), 0);
 
     /* Load the new main screen FIRST - so user sees black screen immediately */
     lv_disp_load_scr(scr);
@@ -780,6 +853,7 @@ int hal_display_ui_init(void) {
         ESP_LOGI(TAG, "Starting happy animation...");
         lvgl_port_lock(0);
         emoji_anim_start(EMOJI_ANIM_HAPPY);
+        hal_display_raise_text_overlay_locked();
         lvgl_port_unlock();
         ESP_LOGI(TAG, "Happy animation started");
     } else {
@@ -792,19 +866,28 @@ int hal_display_ui_init(void) {
 }
 
 int hal_display_input_init(void) {
+    bool button_ready;
+
     if (inputs_initialized) {
+        ESP_LOGI(TAG, "Delayed display inputs already initialized (knob=%d touch=%d)",
+                 s_knob_indev != NULL ? 1 : 0,
+                 s_touch_indev != NULL ? 1 : 0);
         return 0;
     }
 
     if (hal_display_minimal_init() != 0) {
+        ESP_LOGW(TAG, "Delayed display inputs aborted because minimal display init is unavailable");
         return -1;
     }
 
     ESP_LOGI(TAG, "Initializing delayed display inputs...");
 
-    if (hal_button_io_ready()) {
+    button_ready = hal_button_io_ready();
+    ESP_LOGI(TAG, "Button IO ready probe result=%d", button_ready ? 1 : 0);
+
+    if (button_ready) {
         if (hal_display_init_knob_input() == NULL) {
-            ESP_LOGW(TAG, "Knob input initialization failed");
+            ESP_LOGW(TAG, "Knob input initialization failed after successful button probe");
         }
     } else {
         ESP_LOGW(TAG, "Skipping knob input initialization because IO expander button probe failed");
@@ -814,6 +897,10 @@ int hal_display_input_init(void) {
     }
 
     inputs_initialized = (s_knob_indev != NULL) || (s_touch_indev != NULL);
+    ESP_LOGI(TAG, "Delayed display inputs ready: knob=%d touch=%d any=%d",
+             s_knob_indev != NULL ? 1 : 0,
+             s_touch_indev != NULL ? 1 : 0,
+             inputs_initialized ? 1 : 0);
     return inputs_initialized ? 0 : -1;
 }
 
@@ -821,7 +908,7 @@ bool hal_display_has_knob_input(void) {
     return s_knob_indev != NULL;
 }
 
-int hal_display_set_text(const char *text, int font_size) {
+int hal_display_set_text_with_style(const char *text, int font_size, bool alert_text) {
     if (!is_initialized || !label_text) {
         ESP_LOGW(TAG, "Display not initialized");
         return -1;
@@ -834,22 +921,30 @@ int hal_display_set_text(const char *text, int font_size) {
 #define MAX_DISPLAY_CHARS 30
     char truncated[MAX_DISPLAY_CHARS + 4];
     int len = strlen(text);
+    bool should_truncate = !hal_display_text_has_non_ascii(text) && len > MAX_DISPLAY_CHARS;
+    lv_color_t text_color = alert_text ? lv_palette_main(LV_PALETTE_RED) : lv_color_white();
 
-    if (len > MAX_DISPLAY_CHARS) {
+    if (should_truncate) {
         strncpy(truncated, text, MAX_DISPLAY_CHARS);
         strcpy(truncated + MAX_DISPLAY_CHARS, "...");
         ESP_LOGI(TAG, "Set text (truncated): '%s' -> '%s'", text, truncated);
         lvgl_port_lock(0);
+        hal_display_apply_text_style_locked(text, font_size, text_color);
         lv_label_set_text(label_text, truncated);
         lvgl_port_unlock();
     } else {
         ESP_LOGI(TAG, "Set text: '%s' (size %d)", text, font_size);
         lvgl_port_lock(0);
+        hal_display_apply_text_style_locked(text, font_size, text_color);
         lv_label_set_text(label_text, text);
         lvgl_port_unlock();
     }
 
     return 0;
+}
+
+int hal_display_set_text(const char *text, int font_size) {
+    return hal_display_set_text_with_style(text, font_size, false);
 }
 
 int hal_display_set_emoji(int emoji_id) {

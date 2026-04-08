@@ -303,15 +303,6 @@ static void note_frame_switch(emoji_anim_type_t type) {
         return;
     }
 
-    double actual_fps = ((double)g_fps_diag.frame_switches * 1000000.0) / (double)elapsed_us;
-    ESP_LOGI(TAG,
-             "Playback FPS type=%s actual=%.2f target=%d frames=%lu window_ms=%lu",
-             anim_type_name_or_none(type),
-             actual_fps,
-             emoji_anim_get_fps(),
-             (unsigned long)g_fps_diag.frame_switches,
-             (unsigned long)(elapsed_us / 1000ULL));
-
     g_fps_diag.window_start_us = now_us;
     g_fps_diag.frame_switches = 0;
 }
@@ -384,6 +375,10 @@ static void configure_anim_layer(lv_obj_t *img_obj) {
         return;
     }
 
+    /* Keep the image object's layout box stable before frames are assigned.
+     * Otherwise aligning a zero-sized lv_img and then setting src later shifts
+     * the visual center down/right once LVGL updates the intrinsic image size. */
+    lv_obj_set_size(img_obj, ANIM_SOURCE_FRAME_SIZE, ANIM_SOURCE_FRAME_SIZE);
     lv_img_set_pivot(img_obj, ANIM_SOURCE_FRAME_PIVOT, ANIM_SOURCE_FRAME_PIVOT);
     lv_img_set_zoom(img_obj, ANIM_DISPLAY_ZOOM_2X);
     lv_img_set_antialias(img_obj, false);

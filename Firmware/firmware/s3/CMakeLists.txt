@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 
-set(PROJECT_VER "0.1.0-beta")
+set(PROJECT_VER "v0.1.7")
 
 # Extra component directories (nested structure)
 # ESP-IDF only scans components/ directly, so we need to specify subdirectories
@@ -21,6 +21,7 @@ set(EXTRA_COMPONENT_DIRS
     "components/services/anim_service"
     "components/services/behavior_state_service"
     "components/services/camera_service"
+    "components/services/control_ingress"
     "components/services/ota_service"
     "components/services/sfx_service"
     "components/services/voice_service"
@@ -31,6 +32,8 @@ set(EXTRA_COMPONENT_DIRS
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(WatcheRobot-S3)
+# Keep custom generators on the same interpreter as the active ESP-IDF build.
+idf_build_get_property(project_python PYTHON)
 
 if(DEFINED CONFIG_WATCHER_ANIM_FPS)
     set(ANIM_DEFAULT_FPS ${CONFIG_WATCHER_ANIM_FPS})
@@ -41,7 +44,7 @@ endif()
 set(ANIM_IMPORT_DIR ${CMAKE_SOURCE_DIR}/assets/watcher0327png)
 
 add_custom_target(anim_assets_gen
-    COMMAND py -3 ${CMAKE_SOURCE_DIR}/tools/generate_anim_assets.py
+    COMMAND ${project_python} ${CMAKE_SOURCE_DIR}/tools/generate_anim_assets.py
             --spiffs-dir ${CMAKE_SOURCE_DIR}/spiffs
             --output-dir ${CMAKE_SOURCE_DIR}/spiffs/anim
             --import-dir ${ANIM_IMPORT_DIR}

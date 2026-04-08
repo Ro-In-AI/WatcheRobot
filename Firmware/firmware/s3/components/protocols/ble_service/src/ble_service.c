@@ -21,9 +21,11 @@
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
-#include "behavior_state_service.h"
+#include "control_ingress.h"
 #include "esp_bt.h"
+#include "esp_mac.h"
 #include "esp_bt_main.h"
 #include "esp_gap_ble_api.h"
 #include "esp_gatt_common_api.h"
@@ -76,6 +78,14 @@ static uint16_t s_conn_id = 0;
 static bool s_connected = false;
 static bool s_notify_enabled = false;
 static bool s_stack_ready = false;
+static ble_service_connection_callback_t s_connection_cb = NULL;
+
+typedef enum {
+    BLE_PROTOCOL_MODE_LEGACY = 0,
+    BLE_PROTOCOL_MODE_JSON,
+} ble_protocol_mode_t;
+
+static ble_protocol_mode_t s_protocol_mode = BLE_PROTOCOL_MODE_LEGACY;
 
 static esp_ble_adv_params_t s_adv_params = {
     .adv_int_min = 0x20,
@@ -124,6 +134,47 @@ static void ble_gatts_profile_event_handler(esp_gatts_cb_event_t event,
                                             esp_gatt_if_t gatts_if,
                                             esp_ble_gatts_cb_param_t *param);
 static void ble_send_text_notification(const char *text);
+static void ble_send_current_wifi_status_notification(void);
+static void ble_log_local_identity(void);
+
+static void ble_notify_connection_changed(bool connected)
+{
+    if (s_connection_cb != NULL) {
+        s_connection_cb(connected);
+    }
+}
+
+esp_err_t ble_service_get_local_mac(char *buffer, size_t buffer_len)
+{
+    uint8_t mac[6] = {0};
+    int written;
+    esp_err_t ret;
+
+    if (buffer == NULL || buffer_len < 18) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    ret = esp_read_mac(mac, ESP_MAC_BT);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    written = snprintf(buffer, buffer_len, "%02X:%02X:%02X:%02X:%02X:%02X",
+                       mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    return (written > 0 && (size_t)written < buffer_len) ? ESP_OK : ESP_ERR_INVALID_SIZE;
+}
+
+static void ble_log_local_identity(void)
+{
+    char mac_str[18] = {0};
+    esp_err_t ret = ble_service_get_local_mac(mac_str, sizeof(mac_str));
+
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "BLE local identity: name=%s mac=%s", CONFIG_WATCHER_BLE_DEVICE_NAME, mac_str);
+    } else {
+        ESP_LOGW(TAG, "BLE local identity unavailable: %s", esp_err_to_name(ret));
+    }
+}
 
 static void ble_set_response(char *response, size_t response_len, const char *text)
 {
@@ -132,6 +183,181 @@ static void ble_set_response(char *response, size_t response_len, const char *te
     }
 
     snprintf(response, response_len, "%s", text);
+}
+
+static esp_err_t ble_set_json_response(char *response, size_t response_len, cJSON *root)
+{
+    char *json;
+
+    if (response == NULL || response_len == 0 || root == NULL) {
+        if (root != NULL) {
+            cJSON_Delete(root);
+        }
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    json = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (json == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    ble_set_response(response, response_len, json);
+    cJSON_free(json);
+    return ESP_OK;
+}
+
+static const char *ble_wifi_status_to_string(wifi_status_t status)
+{
+    switch (status) {
+        case WIFI_STATUS_CONNECTED:
+            return "connected";
+        case WIFI_STATUS_CONNECTING:
+            return "connecting";
+        case WIFI_STATUS_DISCONNECTED:
+            return "disconnected";
+        case WIFI_STATUS_UNCONFIGURED:
+        default:
+            return "unconfigured";
+    }
+}
+
+static esp_err_t ble_format_wifi_status_json_with_values(wifi_status_t status,
+                                                         const char *ssid,
+                                                         const char *ip_addr,
+                                                         char *response,
+                                                         size_t response_len)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "type", "evt.wifi.status");
+    cJSON_AddNumberToObject(root, "code", 0);
+    cJSON_AddItemToObject(root, "data", data);
+    cJSON_AddStringToObject(data, "status", ble_wifi_status_to_string(status));
+    if (ssid != NULL && ssid[0] != '\0') {
+        cJSON_AddStringToObject(data, "ssid", ssid);
+    }
+    if (ip_addr != NULL && ip_addr[0] != '\0') {
+        cJSON_AddStringToObject(data, "ip", ip_addr);
+    }
+
+    return ble_set_json_response(response, response_len, root);
+}
+
+static esp_err_t ble_format_wifi_status_json(char *response, size_t response_len)
+{
+    char ssid[33] = {0};
+    char ip_addr[16] = {0};
+    wifi_status_t status = wifi_get_status();
+    const char *ssid_ptr = NULL;
+    const char *ip_ptr = NULL;
+
+    if (wifi_get_saved_ssid(ssid, sizeof(ssid)) == 0) {
+        ssid_ptr = ssid;
+    }
+    if (wifi_get_ip_addr(ip_addr, sizeof(ip_addr)) == 0) {
+        ip_ptr = ip_addr;
+    }
+
+    return ble_format_wifi_status_json_with_values(status, ssid_ptr, ip_ptr, response, response_len);
+}
+
+static esp_err_t ble_build_sys_ack_json(const char *message_type,
+                                        const char *command_id,
+                                        char *response,
+                                        size_t response_len)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "type", "sys.ack");
+    cJSON_AddNumberToObject(root, "code", 0);
+    cJSON_AddItemToObject(root, "data", data);
+    cJSON_AddStringToObject(data, "type", message_type != NULL ? message_type : "");
+    if (command_id != NULL && command_id[0] != '\0') {
+        cJSON_AddStringToObject(data, "command_id", command_id);
+    }
+
+    return ble_set_json_response(response, response_len, root);
+}
+
+static esp_err_t ble_build_sys_nack_json(const char *message_type,
+                                         const char *command_id,
+                                         const char *reason,
+                                         int code,
+                                         char *response,
+                                         size_t response_len)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "type", "sys.nack");
+    cJSON_AddNumberToObject(root, "code", code);
+    cJSON_AddItemToObject(root, "data", data);
+    cJSON_AddStringToObject(data, "type", message_type != NULL ? message_type : "");
+    if (command_id != NULL && command_id[0] != '\0') {
+        cJSON_AddStringToObject(data, "command_id", command_id);
+    }
+    if (reason != NULL && reason[0] != '\0') {
+        cJSON_AddStringToObject(data, "reason", reason);
+    }
+
+    return ble_set_json_response(response, response_len, root);
+}
+
+static esp_err_t ble_build_sys_pong_json(char *response, size_t response_len)
+{
+    cJSON *root = cJSON_CreateObject();
+    cJSON *data = cJSON_CreateObject();
+
+    if (root == NULL || data == NULL) {
+        cJSON_Delete(root);
+        cJSON_Delete(data);
+        return ESP_ERR_NO_MEM;
+    }
+
+    cJSON_AddStringToObject(root, "type", "sys.pong");
+    cJSON_AddNumberToObject(root, "code", 0);
+    cJSON_AddItemToObject(root, "data", data);
+    return ble_set_json_response(response, response_len, root);
+}
+
+static void ble_copy_json_string(cJSON *parent, const char *key, char *out, size_t out_size)
+{
+    cJSON *item;
+
+    if (out == NULL || out_size == 0) {
+        return;
+    }
+
+    out[0] = '\0';
+    if (parent == NULL || key == NULL) {
+        return;
+    }
+
+    item = cJSON_GetObjectItem(parent, key);
+    if (cJSON_IsString(item) && item->valuestring != NULL) {
+        snprintf(out, out_size, "%s", item->valuestring);
+    }
 }
 
 static void ble_format_wifi_status(char *response, size_t response_len)
@@ -166,32 +392,72 @@ static void ble_format_wifi_status(char *response, size_t response_len)
     }
 }
 
+static void ble_send_current_wifi_status_notification(void)
+{
+    char *response = calloc(1, GATTS_CHAR_VAL_LEN_MAX + 1);
+
+    if (response == NULL) {
+        ESP_LOGW(TAG, "BLE wifi status alloc failed");
+        return;
+    }
+
+    if (s_protocol_mode == BLE_PROTOCOL_MODE_JSON) {
+        if (ble_format_wifi_status_json(response, GATTS_CHAR_VAL_LEN_MAX + 1) == ESP_OK) {
+            ble_send_text_notification(response);
+        }
+        free(response);
+        return;
+    }
+
+    ble_format_wifi_status(response, GATTS_CHAR_VAL_LEN_MAX + 1);
+    ble_send_text_notification(response);
+    free(response);
+}
+
 static void ble_wifi_status_callback(wifi_status_t status, const char *ssid, const char *ip_addr)
 {
-    char response[96];
+    char *response = calloc(1, GATTS_CHAR_VAL_LEN_MAX + 1);
+
+    if (response == NULL) {
+        ESP_LOGW(TAG, "BLE wifi callback alloc failed");
+        return;
+    }
+
+    if (s_protocol_mode == BLE_PROTOCOL_MODE_JSON) {
+        if (ble_format_wifi_status_json_with_values(status,
+                                                    ssid,
+                                                    ip_addr,
+                                                    response,
+                                                    GATTS_CHAR_VAL_LEN_MAX + 1) == ESP_OK) {
+            ble_send_text_notification(response);
+        }
+        free(response);
+        return;
+    }
 
     switch (status) {
         case WIFI_STATUS_CONNECTED:
-            snprintf(response, sizeof(response), "WIFI_CONNECTED:%s:%s\n",
+            snprintf(response, GATTS_CHAR_VAL_LEN_MAX + 1, "WIFI_CONNECTED:%s:%s\n",
                      ssid ? ssid : "",
                      ip_addr ? ip_addr : "");
             break;
 
         case WIFI_STATUS_CONNECTING:
-            snprintf(response, sizeof(response), "WIFI_CONNECTING:%s\n", ssid ? ssid : "");
+            snprintf(response, GATTS_CHAR_VAL_LEN_MAX + 1, "WIFI_CONNECTING:%s\n", ssid ? ssid : "");
             break;
 
         case WIFI_STATUS_DISCONNECTED:
-            snprintf(response, sizeof(response), "WIFI_DISCONNECTED:%s\n", ssid ? ssid : "");
+            snprintf(response, GATTS_CHAR_VAL_LEN_MAX + 1, "WIFI_DISCONNECTED:%s\n", ssid ? ssid : "");
             break;
 
         case WIFI_STATUS_UNCONFIGURED:
         default:
-            snprintf(response, sizeof(response), "WIFI_UNCONFIGURED\n");
+            snprintf(response, GATTS_CHAR_VAL_LEN_MAX + 1, "WIFI_UNCONFIGURED\n");
             break;
     }
 
     ble_send_text_notification(response);
+    free(response);
 }
 
 static esp_err_t ble_parse_wifi_config(const char *payload, char *response, size_t response_len)
@@ -216,7 +482,9 @@ static esp_err_t ble_parse_wifi_config(const char *payload, char *response, size
     }
 
     ESP_LOGI(TAG, "BLE WiFi provisioning request received for SSID: %s", ssid->valuestring);
-    int ret = wifi_provision(ssid->valuestring, password->valuestring);
+    int ret = s_connected
+                  ? wifi_store_credentials(ssid->valuestring, password->valuestring)
+                  : wifi_provision(ssid->valuestring, password->valuestring);
     cJSON_Delete(root);
 
     if (ret != 0) {
@@ -224,7 +492,7 @@ static esp_err_t ble_parse_wifi_config(const char *payload, char *response, size
         return ESP_FAIL;
     }
 
-    ble_set_response(response, response_len, "WIFI_CONNECTING\n");
+    ble_set_response(response, response_len, s_connected ? "WIFI_SAVED\n" : "WIFI_CONNECTING\n");
     return ESP_OK;
 }
 
@@ -271,15 +539,77 @@ static struct gatts_profile_inst s_profile_tab[PROFILE_NUM] = {
     },
 };
 
+static void ble_cache_text_value(const char *text)
+{
+    size_t len;
+
+    if (text == NULL || s_handle_table[IDX_CHAR_VAL_CMD] == 0) {
+        return;
+    }
+
+    len = strlen(text);
+    if (len > GATTS_CHAR_VAL_LEN_MAX) {
+        len = GATTS_CHAR_VAL_LEN_MAX;
+    }
+
+    if (len == 0) {
+        return;
+    }
+
+    esp_err_t ret = esp_ble_gatts_set_attr_value(s_handle_table[IDX_CHAR_VAL_CMD],
+                                                 (uint16_t)len,
+                                                 (const uint8_t *)text);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG, "BLE cache value failed: %s", esp_err_to_name(ret));
+    }
+}
+
+static void ble_send_write_response(esp_gatt_if_t gatts_if,
+                                    const esp_ble_gatts_cb_param_t *param,
+                                    esp_gatt_status_t status,
+                                    const char *text)
+{
+    esp_gatt_rsp_t rsp = {0};
+    size_t len = 0;
+
+    if (param == NULL || !param->write.need_rsp) {
+        return;
+    }
+
+    rsp.attr_value.handle = param->write.handle;
+    rsp.attr_value.offset = param->write.offset;
+    rsp.attr_value.auth_req = ESP_GATT_AUTH_REQ_NONE;
+
+    if (text != NULL && status == ESP_GATT_OK) {
+        len = strlen(text);
+        if (len > GATTS_CHAR_VAL_LEN_MAX) {
+            len = GATTS_CHAR_VAL_LEN_MAX;
+        }
+        rsp.attr_value.len = (uint16_t)len;
+        if (len > 0) {
+            memcpy(rsp.attr_value.value, text, len);
+        }
+    }
+
+    esp_err_t ret = esp_ble_gatts_send_response(gatts_if,
+                                                param->write.conn_id,
+                                                param->write.trans_id,
+                                                status,
+                                                &rsp);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "BLE send response failed: %s", esp_err_to_name(ret));
+    }
+}
+
 static void ble_send_text_notification(const char *text)
 {
     if (!text) {
         return;
     }
 
+    ble_cache_text_value(text);
+
     if (!s_connected || !s_notify_enabled || s_gatts_if == ESP_GATT_IF_NONE) {
-        ESP_LOGW(TAG, "BLE notify skipped (connected=%d notify=%d if=%d): %s",
-                 s_connected, s_notify_enabled, s_gatts_if, text);
         return;
     }
 
@@ -303,6 +633,7 @@ static void ble_send_text_notification(const char *text)
 
 static esp_err_t ble_parse_and_send_servo(char axis, const char *payload)
 {
+    control_servo_request_t req = {0};
     if (!payload || payload[0] == '\0') {
         return ESP_ERR_INVALID_ARG;
     }
@@ -322,8 +653,12 @@ static esp_err_t ble_parse_and_send_servo(char axis, const char *payload)
         }
     }
 
-    char axis_id[2] = {(char)toupper((unsigned char)axis), '\0'};
-    return hal_servo_send_cmd(axis_id, (int)angle, duration_ms);
+    req.has_x = (toupper((unsigned char)axis) == 'X');
+    req.has_y = (toupper((unsigned char)axis) == 'Y');
+    req.x_deg = (int)angle;
+    req.y_deg = (int)angle;
+    req.duration_ms = duration_ms;
+    return control_ingress_submit_servo(&req);
 }
 
 static esp_err_t ble_parse_set_servo(const char *params)
@@ -347,6 +682,7 @@ static esp_err_t ble_parse_set_servo(const char *params)
 
 static esp_err_t ble_parse_servo_move(const char *params)
 {
+    control_servo_request_t req = {0};
     if (!params) {
         return ESP_ERR_INVALID_ARG;
     }
@@ -375,8 +711,12 @@ static esp_err_t ble_parse_servo_move(const char *params)
         target = (direction > 0) ? CONFIG_WATCHER_SERVO_Y_MAX_DEG : CONFIG_WATCHER_SERVO_Y_MIN_DEG;
     }
 
-    const char axis_id[2] = {(servo_id == 0) ? 'X' : 'Y', '\0'};
-    return hal_servo_send_cmd(axis_id, target, CONFIG_WATCHER_BLE_CMD_DEFAULT_DURATION_MS);
+    req.has_x = (servo_id == 0);
+    req.has_y = (servo_id == 1);
+    req.x_deg = target;
+    req.y_deg = target;
+    req.duration_ms = CONFIG_WATCHER_BLE_CMD_DEFAULT_DURATION_MS;
+    return control_ingress_submit_servo(&req);
 }
 
 static esp_err_t ble_process_line(const char *line, char *response, size_t response_len)
@@ -386,18 +726,21 @@ static esp_err_t ble_process_line(const char *line, char *response, size_t respo
     }
 
     if ((line[0] == 'X' || line[0] == 'x' || line[0] == 'Y' || line[0] == 'y') && line[1] == ':') {
-        ble_set_response(response, response_len, "OK\n");
-        return ble_parse_and_send_servo(line[0], line + 2);
+        esp_err_t ret = ble_parse_and_send_servo(line[0], line + 2);
+        ble_set_response(response, response_len, ret == ESP_ERR_TIMEOUT ? "ERR_BUSY\n" : "OK\n");
+        return ret;
     }
 
     if (strncmp(line, "SET_SERVO:", 10) == 0) {
-        ble_set_response(response, response_len, "OK\n");
-        return ble_parse_set_servo(line + 10);
+        esp_err_t ret = ble_parse_set_servo(line + 10);
+        ble_set_response(response, response_len, ret == ESP_ERR_TIMEOUT ? "ERR_BUSY\n" : "OK\n");
+        return ret;
     }
 
     if (strncmp(line, "SERVO_MOVE:", 11) == 0) {
-        ble_set_response(response, response_len, "OK\n");
-        return ble_parse_servo_move(line + 11);
+        esp_err_t ret = ble_parse_servo_move(line + 11);
+        ble_set_response(response, response_len, ret == ESP_ERR_TIMEOUT ? "ERR_BUSY\n" : "OK\n");
+        return ret;
     }
 
     if (strncmp(line, "WIFI_CONFIG:", 12) == 0) {
@@ -437,67 +780,249 @@ static const char *ble_skip_whitespace(const char *text)
     return text;
 }
 
-static esp_err_t ble_process_state_json(const char *json_text)
+static esp_err_t ble_process_json_payload(const char *json_text,
+                                          char *response,
+                                          size_t response_len,
+                                          bool *send_wifi_status_after_response)
 {
     cJSON *root = NULL;
     cJSON *data = NULL;
     cJSON *type_item = NULL;
-    cJSON *state_item = NULL;
-    esp_err_t ret = ESP_FAIL;
+    cJSON *value_item = NULL;
+    char command_id[48];
+    char message_type_buf[48];
+    const char *message_type = NULL;
+
+    if (send_wifi_status_after_response != NULL) {
+        *send_wifi_status_after_response = false;
+    }
 
     root = cJSON_Parse(json_text);
     if (root == NULL) {
+        ble_build_sys_nack_json("invalid", NULL, "invalid_json", 400, response, response_len);
         return ESP_ERR_INVALID_ARG;
     }
 
     type_item = cJSON_GetObjectItem(root, "type");
     data = cJSON_GetObjectItem(root, "data");
-    if (type_item == NULL || !cJSON_IsString(type_item) ||
-        strcmp(type_item->valuestring, "ctrl.robot.state.set") != 0 ||
-        data == NULL || !cJSON_IsObject(data)) {
+    if (!cJSON_IsString(type_item) || type_item->valuestring == NULL || !cJSON_IsObject(data)) {
         cJSON_Delete(root);
-        return ESP_ERR_NOT_SUPPORTED;
-    }
-
-    state_item = cJSON_GetObjectItem(data, "state_id");
-    if (state_item == NULL || !cJSON_IsString(state_item) || state_item->valuestring[0] == '\0') {
-        cJSON_Delete(root);
+        ble_build_sys_nack_json("invalid", NULL, "invalid_payload", 400, response, response_len);
         return ESP_ERR_INVALID_ARG;
     }
 
-    ret = behavior_state_set(state_item->valuestring);
+    message_type = type_item->valuestring;
+    snprintf(message_type_buf, sizeof(message_type_buf), "%s", message_type);
+    message_type = message_type_buf;
+    ble_copy_json_string(data, "command_id", command_id, sizeof(command_id));
+    if (strcmp(message_type, "ctrl.servo.angle") == 0) {
+        cJSON *x_item = cJSON_GetObjectItem(data, "x_deg");
+        cJSON *y_item = cJSON_GetObjectItem(data, "y_deg");
+        cJSON *duration_item = cJSON_GetObjectItem(data, "duration_ms");
+        bool has_x = cJSON_IsNumber(x_item);
+        bool has_y = cJSON_IsNumber(y_item);
+        int duration_ms = CONFIG_WATCHER_BLE_CMD_DEFAULT_DURATION_MS;
+        control_servo_request_t req = {0};
+        esp_err_t ret;
+
+        if (has_x == has_y) {
+            cJSON_Delete(root);
+            ble_build_sys_nack_json(message_type, command_id, "invalid_servo_payload", 400, response, response_len);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        if (cJSON_IsNumber(duration_item)) {
+            duration_ms = duration_item->valueint;
+        }
+        if (duration_ms < 0 || duration_ms > 5000) {
+            cJSON_Delete(root);
+            ble_build_sys_nack_json(message_type, command_id, "invalid_duration_ms", 400, response, response_len);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        req.has_x = has_x;
+        req.has_y = has_y;
+        req.x_deg = has_x ? (int)(x_item->valuedouble + 0.5) : 0;
+        req.y_deg = has_y ? (int)(y_item->valuedouble + 0.5) : 0;
+        req.duration_ms = duration_ms;
+        if ((has_x && (req.x_deg < 0 || req.x_deg > 180)) ||
+            (has_y && (req.y_deg < 0 || req.y_deg > 180))) {
+            cJSON_Delete(root);
+            ble_build_sys_nack_json(message_type, command_id, "angle_out_of_range", 400, response, response_len);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        ret = control_ingress_submit_servo(&req);
+        cJSON_Delete(root);
+        if (ret == ESP_ERR_TIMEOUT) {
+            ble_build_sys_nack_json(message_type, command_id, "busy", 503, response, response_len);
+            return ret;
+        }
+        if (ret != ESP_OK) {
+            ble_build_sys_nack_json(message_type, command_id, "servo_move_failed", 500, response, response_len);
+            return ret;
+        }
+        return ble_build_sys_ack_json(message_type, command_id, response, response_len);
+    }
+
+    if (strcmp(message_type, "evt.ai.status") == 0) {
+        control_ai_status_request_t req = {0};
+        esp_err_t ret;
+
+        ble_copy_json_string(data, "status", req.status, sizeof(req.status));
+        ble_copy_json_string(data, "message", req.message, sizeof(req.message));
+        ble_copy_json_string(data, "image_name", req.image_name, sizeof(req.image_name));
+        ble_copy_json_string(data, "action_file", req.action_file, sizeof(req.action_file));
+        ble_copy_json_string(data, "sound_file", req.sound_file, sizeof(req.sound_file));
+
+        if (req.status[0] == '\0') {
+            cJSON_Delete(root);
+            ble_build_sys_nack_json(message_type, command_id, "invalid_status_payload", 400, response, response_len);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        ret = control_ingress_submit_ai_status(&req);
+        cJSON_Delete(root);
+        if (ret == ESP_ERR_TIMEOUT) {
+            ble_build_sys_nack_json(message_type, command_id, "busy", 503, response, response_len);
+            return ret;
+        }
+        if (ret != ESP_OK) {
+            ble_build_sys_nack_json(message_type,
+                                    command_id,
+                                    "ai_status_apply_failed",
+                                    400,
+                                    response,
+                                    response_len);
+            return ret;
+        }
+        return ble_build_sys_ack_json(message_type, command_id, response, response_len);
+    }
+
+    if (strcmp(message_type, "ctrl.robot.state.set") == 0) {
+        char state_id[32];
+        control_state_set_request_t req = {0};
+        esp_err_t ret;
+
+        ble_copy_json_string(data, "state_id", state_id, sizeof(state_id));
+        cJSON_Delete(root);
+        if (state_id[0] == '\0') {
+            ble_build_sys_nack_json(message_type, command_id, "invalid_state_payload", 400, response, response_len);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        snprintf(req.state_id, sizeof(req.state_id), "%s", state_id);
+        ret = control_ingress_submit_state_set(&req);
+        if (ret == ESP_ERR_TIMEOUT) {
+            ble_build_sys_nack_json(message_type, command_id, "busy", 503, response, response_len);
+            return ret;
+        }
+        if (ret != ESP_OK) {
+            ble_build_sys_nack_json(message_type, command_id, "state_set_failed", 400, response, response_len);
+            return ret;
+        }
+        return ble_build_sys_ack_json(message_type, command_id, response, response_len);
+    }
+
+    if (strcmp(message_type, "cfg.wifi.set") == 0) {
+        char ssid[33];
+        char password[65];
+        int ret;
+
+        ble_copy_json_string(data, "ssid", ssid, sizeof(ssid));
+        ble_copy_json_string(data, "password", password, sizeof(password));
+        cJSON_Delete(root);
+        if (ssid[0] == '\0' || password[0] == '\0') {
+            ble_build_sys_nack_json(message_type, command_id, "invalid_wifi_payload", 400, response, response_len);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        ret = s_connected ? wifi_store_credentials(ssid, password) : wifi_provision(ssid, password);
+        if (ret != 0) {
+            ble_build_sys_nack_json(message_type, command_id, "wifi_config_failed", 500, response, response_len);
+            return ESP_FAIL;
+        }
+        return ble_build_sys_ack_json(message_type, command_id, response, response_len);
+    }
+
+    if (strcmp(message_type, "cfg.wifi.get") == 0) {
+        cJSON_Delete(root);
+        if (send_wifi_status_after_response != NULL) {
+            *send_wifi_status_after_response = true;
+        }
+        return ble_build_sys_ack_json(message_type, command_id, response, response_len);
+    }
+
+    if (strcmp(message_type, "cfg.wifi.clear") == 0) {
+        int ret;
+
+        cJSON_Delete(root);
+        ret = wifi_clear_credentials();
+        if (ret != 0) {
+            ble_build_sys_nack_json(message_type, command_id, "wifi_clear_failed", 500, response, response_len);
+            return ESP_FAIL;
+        }
+        if (send_wifi_status_after_response != NULL) {
+            *send_wifi_status_after_response = true;
+        }
+        return ble_build_sys_ack_json(message_type, command_id, response, response_len);
+    }
+
+    if (strcmp(message_type, "sys.ping") == 0) {
+        cJSON_Delete(root);
+        return ble_build_sys_pong_json(response, response_len);
+    }
+
+    value_item = cJSON_GetObjectItem(root, "type");
+    if (cJSON_IsString(value_item) && value_item->valuestring != NULL) {
+        snprintf(message_type_buf, sizeof(message_type_buf), "%s", value_item->valuestring);
+    } else {
+        snprintf(message_type_buf, sizeof(message_type_buf), "%s", "unknown");
+    }
+    message_type = message_type_buf;
     cJSON_Delete(root);
-    return ret;
+    ble_build_sys_nack_json(message_type, command_id, "unsupported_type", 400, response, response_len);
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 static esp_err_t ble_process_payload(const uint8_t *data, uint16_t len,
-                                     char *response, size_t response_len)
+                                     char *response,
+                                     size_t response_len,
+                                     bool *send_wifi_status_after_response)
 {
+    char *buffer = NULL;
+    size_t copy_len;
+    esp_err_t final_ret = ESP_OK;
+
     if (!data || len == 0) {
         ble_set_response(response, response_len, "ERR\n");
         return ESP_ERR_INVALID_ARG;
     }
 
-    char buffer[GATTS_CHAR_VAL_LEN_MAX + 1];
-    size_t copy_len = (len < GATTS_CHAR_VAL_LEN_MAX) ? len : GATTS_CHAR_VAL_LEN_MAX;
+    copy_len = (len < GATTS_CHAR_VAL_LEN_MAX) ? len : GATTS_CHAR_VAL_LEN_MAX;
+    buffer = calloc(1, copy_len + 1);
+    if (buffer == NULL) {
+        ble_set_response(response, response_len, "ERR_NO_MEM\n");
+        return ESP_ERR_NO_MEM;
+    }
+
     memcpy(buffer, data, copy_len);
     buffer[copy_len] = '\0';
 
     if (ble_skip_whitespace(buffer)[0] == '{') {
-        esp_err_t ret = ble_process_state_json(ble_skip_whitespace(buffer));
-        if (ret == ESP_OK) {
-            ble_set_response(response, response_len, "OK\n");
-        } else if (ret == ESP_ERR_NOT_SUPPORTED) {
-            ble_set_response(response, response_len, "ERR_UNSUPPORTED\n");
-        } else {
-            ble_set_response(response, response_len, "ERR\n");
-        }
-        return ret;
+        s_protocol_mode = BLE_PROTOCOL_MODE_JSON;
+        final_ret = ble_process_json_payload(ble_skip_whitespace(buffer),
+                                             response,
+                                             response_len,
+                                             send_wifi_status_after_response);
+        free(buffer);
+        return final_ret;
     }
 
     char *ptr = buffer;
     char *line = buffer;
-    esp_err_t final_ret = ESP_OK;
+
+    s_protocol_mode = BLE_PROTOCOL_MODE_LEGACY;
 
     if (response && response_len > 0) {
         response[0] = '\0';
@@ -531,6 +1056,7 @@ static esp_err_t ble_process_payload(const uint8_t *data, uint16_t len,
         line = ptr;
     }
 
+    free(buffer);
     return final_ret;
 }
 
@@ -627,26 +1153,46 @@ static void ble_gatts_profile_event_handler(esp_gatts_cb_event_t event,
                     ESP_LOGI(TAG, "BLE notify %s (cccd=0x%04x)",
                              s_notify_enabled ? "enabled" : "disabled", cccd);
                     if (s_notify_enabled) {
-                        char status_text[96];
-                        ble_format_wifi_status(status_text, sizeof(status_text));
-                        ble_send_text_notification(status_text);
+                        ble_send_current_wifi_status_notification();
                     }
                 } else if (s_handle_table[IDX_CHAR_VAL_CMD] == param->write.handle &&
                            param->write.value && param->write.len > 0) {
-                    char response[96];
-                    esp_err_t ret = ble_process_payload(param->write.value, param->write.len,
-                                                        response, sizeof(response));
+                    char *response = calloc(1, GATTS_CHAR_VAL_LEN_MAX + 1);
+                    const char *reply_text = NULL;
+                    bool send_wifi_status_after_response = false;
+                    esp_err_t ret;
+
+                    if (response == NULL) {
+                        ble_send_write_response(gatts_if, param, ESP_GATT_NO_RESOURCES, NULL);
+                        ESP_LOGW(TAG, "BLE response alloc failed");
+                        break;
+                    }
+
+                    ret = ble_process_payload(param->write.value,
+                                              param->write.len,
+                                              response,
+                                              GATTS_CHAR_VAL_LEN_MAX + 1,
+                                              &send_wifi_status_after_response);
+                    reply_text = response[0] != '\0' ? response : (ret == ESP_OK ? "OK\n" : "ERR\n");
+
+                    ble_cache_text_value(reply_text);
+                    ble_send_write_response(gatts_if, param, ESP_GATT_OK, reply_text);
+
                     if (ret == ESP_OK) {
-                        ble_send_text_notification(response[0] != '\0' ? response : "OK\n");
+                        if (!param->write.need_rsp) {
+                            ble_send_text_notification(reply_text);
+                        }
+                        if (send_wifi_status_after_response && s_notify_enabled) {
+                            ble_send_current_wifi_status_notification();
+                        }
                     } else {
-                        ble_send_text_notification(response[0] != '\0' ? response : "ERR\n");
+                        if (!param->write.need_rsp) {
+                            ble_send_text_notification(reply_text);
+                        }
                         ESP_LOGW(TAG, "BLE motion command rejected: %s", esp_err_to_name(ret));
                     }
-                }
 
-                if (param->write.need_rsp) {
-                    esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
-                                                param->write.trans_id, ESP_GATT_OK, NULL);
+                    free(response);
                 }
             } else if (param->write.need_rsp) {
                 esp_ble_gatts_send_response(gatts_if, param->write.conn_id,
@@ -658,14 +1204,18 @@ static void ble_gatts_profile_event_handler(esp_gatts_cb_event_t event,
             s_conn_id = param->connect.conn_id;
             s_connected = true;
             s_notify_enabled = false;
+            s_protocol_mode = BLE_PROTOCOL_MODE_LEGACY;
             ESP_LOGI(TAG, "BLE client connected, conn_id=%d", s_conn_id);
+            ble_notify_connection_changed(true);
             break;
 
         case ESP_GATTS_DISCONNECT_EVT:
             s_connected = false;
             s_notify_enabled = false;
+            s_protocol_mode = BLE_PROTOCOL_MODE_LEGACY;
             ESP_LOGI(TAG, "BLE client disconnected (reason=0x%x), restart adv",
                      param->disconnect.reason);
+            ble_notify_connection_changed(false);
             esp_ble_gap_start_advertising(&s_adv_params);
             break;
 
@@ -806,6 +1356,7 @@ esp_err_t ble_service_init(void)
 
     wifi_register_status_callback(ble_wifi_status_callback);
     s_stack_ready = true;
+    ble_log_local_identity();
     ESP_LOGI(TAG, "BLE motion service initialized (name=%s)", CONFIG_WATCHER_BLE_DEVICE_NAME);
     return ESP_OK;
 }
@@ -837,6 +1388,11 @@ bool ble_service_is_connected(void)
     return s_connected;
 }
 
+void ble_service_register_connection_callback(ble_service_connection_callback_t cb)
+{
+    s_connection_cb = cb;
+}
+
 #else
 
 #include "esp_err.h"
@@ -862,6 +1418,18 @@ esp_err_t ble_service_stop_advertising(void)
 bool ble_service_is_connected(void)
 {
     return false;
+}
+
+esp_err_t ble_service_get_local_mac(char *buffer, size_t buffer_len)
+{
+    (void)buffer;
+    (void)buffer_len;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+void ble_service_register_connection_callback(ble_service_connection_callback_t cb)
+{
+    (void)cb;
 }
 
 #endif

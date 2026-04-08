@@ -14,6 +14,8 @@
 static char g_current_text[MAX_TEXT_LEN] = {0};
 static emoji_type_t g_current_emoji = EMOJI_STANDBY;
 static const int DEFAULT_FONT_SIZE = 24;
+static int g_current_font_size = 0;
+static display_text_style_t g_current_text_style = DISPLAY_TEXT_STYLE_NORMAL;
 
 static emoji_type_t sync_current_emoji_from_hal(void) {
     int actual_emoji = hal_display_get_current_emoji_id();
@@ -29,6 +31,10 @@ static int text_equals_current(const char *text) {
     }
 
     return strncmp(g_current_text, text, MAX_TEXT_LEN) == 0;
+}
+
+static int normalize_font_size(int font_size) {
+    return (font_size > 0) ? font_size : DEFAULT_FONT_SIZE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -57,6 +63,8 @@ static int strcasecmp_local(const char *a, const char *b) {
 void display_ui_init(void) {
     memset(g_current_text, 0, sizeof(g_current_text));
     g_current_emoji = EMOJI_STANDBY;
+    g_current_font_size = DEFAULT_FONT_SIZE;
+    g_current_text_style = DISPLAY_TEXT_STYLE_NORMAL;
 
     /* Initialize HAL display */
     hal_display_init();
@@ -101,6 +109,10 @@ emoji_type_t display_emoji_from_string(const char *emoji_str) {
         return EMOJI_ERROR;
     }
 
+    if (strcasecmp_local(emoji_str, "bluetooth") == 0) {
+        return EMOJI_BLUETOOTH;
+    }
+
     if (strcasecmp_local(emoji_str, "custom1") == 0) {
         return EMOJI_CUSTOM_1;
     }
@@ -118,11 +130,16 @@ emoji_type_t display_emoji_from_string(const char *emoji_str) {
 /* Public: Update display                                             */
 /* ------------------------------------------------------------------ */
 
-int display_update(const char *text, const char *emoji, int font_size, display_result_t *out_result) {
+int display_update_with_style(const char *text,
+                              const char *emoji,
+                              int font_size,
+                              display_text_style_t text_style,
+                              display_result_t *out_result) {
     emoji_type_t requested_emoji = EMOJI_UNKNOWN;
     int text_changed = 0;
     int emoji_changed = 0;
     int emoji_request_attempted = 0;
+    int normalized_font_size = normalize_font_size(font_size);
     emoji_type_t previous_emoji = sync_current_emoji_from_hal();
     emoji_type_t actual_emoji = previous_emoji;
 
@@ -138,18 +155,21 @@ int display_update(const char *text, const char *emoji, int font_size, display_r
         }
     }
 
-    text_changed = (text != NULL && !text_equals_current(text));
+    text_changed = (text != NULL &&
+                    (!text_equals_current(text) || g_current_font_size != normalized_font_size ||
+                     g_current_text_style != text_style));
     emoji_changed = (emoji != NULL && requested_emoji != previous_emoji);
 
     /* Update text if provided */
     if (text_changed) {
-        int fs = (font_size > 0) ? font_size : DEFAULT_FONT_SIZE;
-        if (hal_display_set_text(text, fs) != 0) {
+        if (hal_display_set_text_with_style(text, normalized_font_size, text_style == DISPLAY_TEXT_STYLE_ALERT) != 0) {
             return -1;
         }
         /* Store current text */
         strncpy(g_current_text, text, MAX_TEXT_LEN - 1);
         g_current_text[MAX_TEXT_LEN - 1] = '\0';
+        g_current_font_size = normalized_font_size;
+        g_current_text_style = text_style;
 
         if (out_result) {
             out_result->text_updated = 1;
@@ -198,6 +218,10 @@ int display_update(const char *text, const char *emoji, int font_size, display_r
     }
 
     return 0;
+}
+
+int display_update(const char *text, const char *emoji, int font_size, display_result_t *out_result) {
+    return display_update_with_style(text, emoji, font_size, DISPLAY_TEXT_STYLE_NORMAL, out_result);
 }
 
 /* ------------------------------------------------------------------ */

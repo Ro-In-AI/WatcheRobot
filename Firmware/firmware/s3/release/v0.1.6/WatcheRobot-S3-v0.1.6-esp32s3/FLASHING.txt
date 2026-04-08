@@ -1,0 +1,19 @@
+WatcheRobot S3 firmware release package
+Version: v0.1.6
+Target: ESP32-S3 / SenseCAP Watcher
+
+Recommended validation focus:
+- Bluetooth feedback animation and sound state
+- TTS playback recovery after audio-path drop
+- Cached WebSocket resume after BLE disconnect
+- Speaking / thinking action timing and startup transitions
+
+Flash layout:
+0x00000000 bootloader.bin
+0x00008000 partition-table.bin
+0x00010000 WatcheRobot-S3.bin
+0x00410000 srmodels.bin
+0x00460000 storage.bin
+
+Example:
+python -m esptool --chip esp32s3 -b 460800 --before default_reset --after hard_reset write_flash --flash_mode dio --flash_size 16MB --flash_freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 WatcheRobot-S3.bin 0x410000 srmodels.bin 0x460000 storage.bin
